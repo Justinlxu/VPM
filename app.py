@@ -129,18 +129,9 @@ if st.button("Predict", type="primary", use_container_width=True):
 
         st.divider()
 
-        # Data available
-        hist_a     = team_history.get(team_a, [])
-        hist_b     = team_history.get(team_b, [])
-        map_hist_a = [h for h in hist_a if h["map"] == map_name]
-        map_hist_b = [h for h in hist_b if h["map"] == map_name]
-
-        with st.expander("Data available"):
-            st.write(f"**{team_a}:** {len(hist_a)} total maps, {len(map_hist_a)} on {map_name}")
-            st.write(f"**{team_b}:** {len(hist_b)} total maps, {len(map_hist_b)} on {map_name}")
-
-        # Key stats table
         feat_dict = dict(zip(feature_cols, features_row.iloc[0]))
+
+        st.subheader("Last 5 maps overall")
         rows = []
         for stat, label in [("acs_overall_5", "ACS"), ("kast_overall_5", "KAST"),
                              ("fk_fd_diff_overall_5", "FK/FD Diff"), ("gun_rate_overall_5", "Gun Rate")]:
@@ -151,10 +142,9 @@ if st.button("Predict", type="primary", use_container_width=True):
                 team_a: f"{a_val:.2f}" if not pd.isna(a_val) else "N/A",
                 team_b: f"{b_val:.2f}" if not pd.isna(b_val) else "N/A",
             })
+        st.dataframe(pd.DataFrame(rows).set_index("Stat"), use_container_width=True)
 
-        with st.expander("Key stats (last 5 maps overall)"):
-            st.dataframe(pd.DataFrame(rows).set_index("Stat"), use_container_width=True)
-
+        st.subheader(f"Last 5 maps on {map_name}")
         rows_map = []
         for stat, label in [("acs_map_5", "ACS"), ("kast_map_5", "KAST"),
                              ("fk_fd_diff_map_5", "FK/FD Diff"), ("gun_rate_map_5", "Gun Rate")]:
@@ -165,6 +155,4 @@ if st.button("Predict", type="primary", use_container_width=True):
                 team_a: f"{a_val:.2f}" if not pd.isna(a_val) else "N/A",
                 team_b: f"{b_val:.2f}" if not pd.isna(b_val) else "N/A",
             })
-
-        with st.expander(f"Key stats (last 5 maps on {map_name})"):
-            st.dataframe(pd.DataFrame(rows_map).set_index("Stat"), use_container_width=True)
+        st.dataframe(pd.DataFrame(rows_map).set_index("Stat"), use_container_width=True)
