@@ -89,7 +89,7 @@ def compute_features(team_a, team_b, map_name, team_history, feature_cols):
 
 # ── UI ─────────────────────────────────────────────────────────────
 st.set_page_config(page_title="VPM", page_icon="🎯", layout="centered")
-st.title("Valorant Match Predictor")
+st.title("Valorant Prediction Model")
 
 try:
     model, feature_cols, team_history, teams, maps_seen = load_data()
