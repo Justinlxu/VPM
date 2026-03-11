@@ -9,6 +9,8 @@ import pandas as pd
 import numpy as np
 import joblib
 import json
+import requests
+from bs4 import BeautifulSoup
 from collections import defaultdict
 
 # ── Paths ──────────────────────────────────────────────────────────
@@ -24,6 +26,88 @@ RAW_STATS = [
     ("fk_fd_diff", "FK/FD Diff A", "FK/FD Diff B"),
     ("gun_rate",   "Gun Rate A",   "Gun Rate B"),
 ]
+
+
+# ── Upcoming matches (cached 5 min) ───────────────────────────────
+@st.cache_data(ttl=300)
+def fetch_upcoming_matches():
+    try:
+        headers = {"User-Agent": "ValorantPredictor/1.0 (esports research project)"}
+        resp = requests.get("https://www.vlr.gg/matches", headers=headers, timeout=10)
+        if resp.status_code != 200:
+            return []
+
+        soup = BeautifulSoup(resp.text, "lxml")
+        matches = []
+
+        for link in soup.select("a.match-item"):
+            # Team names
+            team_els = link.select(".match-item-vs-team-name")
+            if len(team_els) < 2:
+                continue
+            team_a = team_els[0].get_text(strip=True)
+            team_b = team_els[1].get_text(strip=True)
+            if not team_a or not team_b or team_a == "TBD" or team_b == "TBD":
+                continue
+
+            # Series score (maps won)
+            score_spans = link.select(".match-item-vs-team-score")
+            series_scores = [s.get_text(strip=True) for s in score_spans]
+            has_score = any(s.isdigit() for s in series_scores)
+            maps_a = int(series_scores[0]) if len(series_scores) > 0 and series_scores[0].isdigit() else 0
+            maps_b = int(series_scores[1]) if len(series_scores) > 1 and series_scores[1].isdigit() else 0
+
+            # Live status
+            eta_el = link.select_one(".match-item-eta")
+            eta_text = eta_el.get_text(strip=True).lower() if eta_el else ""
+            is_live = "live" in eta_text
+
+            # Time label
+            time_label = ""
+            if has_score and not is_live:
+                time_label = "Finished"
+            elif is_live:
+                time_label = "🔴 Live"
+            else:
+                ts_el = link.select_one(".moment-tz-convert") or link.select_one(".match-item-time")
+                if ts_el:
+                    utc_ts = ts_el.get("data-utc-ts", "").strip()
+                    if utc_ts:
+                        try:
+                            from datetime import datetime, timezone
+                            dt = datetime.strptime(utc_ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                            time_label = dt.strftime("%b %d, %I:%M %p UTC").replace(" 0", " ")
+                        except ValueError:
+                            time_label = ts_el.get_text(strip=True)
+                    else:
+                        time_label = ts_el.get_text(strip=True)
+                if not time_label:
+                    raw = eta_el.get_text(strip=True) if eta_el else ""
+                    time_label = raw if raw.lower() not in ("upcoming", "") else ""
+
+            matches.append({
+                "team_a": team_a,
+                "team_b": team_b,
+                "maps_a": maps_a,
+                "maps_b": maps_b,
+                "time_label": time_label,
+                "is_live": is_live,
+                "is_finished": has_score and not is_live,
+            })
+
+        return matches
+    except Exception:
+        return []
+
+
+def fuzzy_match_team(name, teams):
+    """Find the closest team name in our model data."""
+    name_lower = name.strip().lower()
+    for t in teams:
+        if t.lower() == name_lower:
+            return t
+    matches = [t for t in teams if name_lower in t.lower() or t.lower() in name_lower]
+    return matches[0] if len(matches) == 1 else None
 
 
 # ── Data loading (cached) ──────────────────────────────────────────
@@ -97,11 +181,87 @@ except Exception as e:
     st.error(f"Failed to load model or data: {e}")
     st.stop()
 
+# ── Card CSS ────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+[data-testid="column"] [data-testid="baseButton-secondary"] {
+    background: transparent !important;
+    border: 1px solid rgba(150,150,150,0.25) !important;
+    border-radius: 10px !important;
+    text-align: left !important;
+    padding: 12px 14px !important;
+    height: auto !important;
+    min-height: 80px !important;
+    width: 100% !important;
+    white-space: pre-line !important;
+    line-height: 1.7 !important;
+    color: inherit !important;
+    font-weight: normal !important;
+}
+[data-testid="column"] [data-testid="baseButton-secondary"] p {
+    text-align: left !important;
+    white-space: pre-line !important;
+    margin: 0 !important;
+}
+[data-testid="column"] [data-testid="baseButton-secondary"]:hover {
+    border-color: rgba(150,150,150,0.55) !important;
+    background: rgba(255,255,255,0.03) !important;
+    color: inherit !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ── Upcoming matches ───────────────────────────────────────────────
+if "sel_team_a" not in st.session_state:
+    st.session_state.sel_team_a = None
+if "sel_team_b" not in st.session_state:
+    st.session_state.sel_team_b = None
+
+upcoming = fetch_upcoming_matches()
+if upcoming:
+    live      = [m for m in upcoming if m["is_live"]]
+    scheduled = [m for m in upcoming if not m["is_live"] and not m["is_finished"]]
+
+    def match_cards(matches, prefix):
+        matches = [m for m in matches
+                   if fuzzy_match_team(m["team_a"], teams) and fuzzy_match_team(m["team_b"], teams)]
+        if not matches:
+            return
+        cols = st.columns(len(matches))
+        for col, m in zip(cols, matches):
+            with col:
+                if m["is_live"]:
+                    score_a = f"  {m['maps_a']}"
+                    score_b = f"  {m['maps_b']}"
+                else:
+                    score_a = ""
+                    score_b = ""
+                label = f"{m['team_a']}{score_a}  \n{m['team_b']}{score_b}  \n{m['time_label']}"
+                if st.button(label, key=f"{prefix}_{m['team_a']}_{m['team_b']}", use_container_width=True):
+                    st.session_state.sel_team_a = fuzzy_match_team(m["team_a"], teams)
+                    st.session_state.sel_team_b = fuzzy_match_team(m["team_b"], teams)
+
+    if live:
+        st.subheader("Live now")
+        match_cards(live[:5], "live")
+
+    if scheduled:
+        st.subheader("Upcoming")
+        match_cards(scheduled[:5], "up")
+
+st.divider()
+
+# ── Prediction form ────────────────────────────────────────────────
+def team_index(name):
+    if name and name in teams:
+        return teams.index(name)
+    return None
+
 col1, col2 = st.columns(2)
 with col1:
-    team_a = st.selectbox("Team A", teams, index=None, placeholder="Select team...")
+    team_a = st.selectbox("Team A", teams, index=team_index(st.session_state.sel_team_a), placeholder="Select team...")
 with col2:
-    team_b = st.selectbox("Team B", teams, index=None, placeholder="Select team...")
+    team_b = st.selectbox("Team B", teams, index=team_index(st.session_state.sel_team_b), placeholder="Select team...")
 
 map_name = st.selectbox("Map", maps_seen, index=None, placeholder="Select map...")
 
