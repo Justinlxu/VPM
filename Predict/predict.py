@@ -17,6 +17,9 @@ import joblib
 import json
 from collections import defaultdict
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "Retraining"))
+from player_elo import load_player_data, build_ranking_elo, RANKING_ELO_START
+
 # ══════════════════════════════════════════════════════════════════
 # CONFIG — must match feature_engineering_v3.py exactly
 # ══════════════════════════════════════════════════════════════════
@@ -74,10 +77,107 @@ def build_team_histories(filepath):
 
 
 # ══════════════════════════════════════════════════════════════════
+# PLAYER ELO FEATURES
+# ══════════════════════════════════════════════════════════════════
+
+ELO_TREND_WINDOW = 5
+
+
+def build_team_elo_features(team_a, team_b, filepath):
+    """
+    Compute ranking Elo sum and trend for two teams using current player Elo ratings.
+    Uses each team's most recent known lineup for the current Elo sum.
+    Trend is the slope of team Elo total over their last ELO_TREND_WINDOW maps.
+    """
+    player_df = load_player_data(filepath)
+    _, ranking_elo_history, _ = build_ranking_elo(player_df)
+
+    # Final Elo ratings
+    final_elos = {}
+    for map_id, snap in ranking_elo_history.items():
+        for player, elo in snap.items():
+            final_elos[player] = elo
+    # Apply final changes (last map snapshot is before, so use post-map values)
+    # Re-derive from last appearance in history
+    for map_id in reversed(list(ranking_elo_history.keys())):
+        snap = ranking_elo_history[map_id]
+        for player in snap:
+            if player not in final_elos:
+                final_elos[player] = snap[player]
+
+    # Build per-team map history: {team: [(date, match_id, [player_elos])]}
+    team_map_history = defaultdict(list)
+    map_ids_ordered = player_df["Match ID"].unique()
+
+    for map_id in map_ids_ordered:
+        map_rows = player_df[player_df["Match ID"] == map_id]
+        date = map_rows["Date"].iloc[0]
+        snap = ranking_elo_history.get(map_id, {})
+
+        teams_in_map = map_rows["Team"].unique()
+        for team in teams_in_map:
+            players = map_rows[map_rows["Team"] == team]["Player Name"].tolist()
+            elos = [snap.get(p, RANKING_ELO_START) for p in players]
+            team_map_history[team].append((date, map_id, players, elos))
+
+    # Per-player recent FK/FD diff (last 5 maps average)
+    player_fkfd = {}
+    for player in player_df["Player Name"].unique():
+        rows = player_df[player_df["Player Name"] == player].tail(5)
+        if len(rows) > 0:
+            player_fkfd[player] = float((rows["FK"] - rows["FD"]).mean())
+
+    def get_elo_features(team):
+        history = team_map_history.get(team, [])
+        if not history:
+            return RANKING_ELO_START * 5, 0.0
+
+        # Current Elo sum from most recent lineup
+        _, _, players, _ = history[-1]
+        elo_sum = sum(final_elos.get(p, RANKING_ELO_START) for p in players)
+
+        # Trend from last ELO_TREND_WINDOW maps
+        recent = history[-ELO_TREND_WINDOW:]
+        if len(recent) < 2:
+            return elo_sum, 0.0
+
+        totals = [sum(elos) for _, _, _, elos in recent]
+        x = np.arange(len(totals))
+        trend = float(np.polyfit(x, totals, 1)[0])
+        return elo_sum, trend
+
+    def get_player_info(team):
+        history = team_map_history.get(team, [])
+        if not history:
+            return []
+        _, _, players, _ = history[-1]
+        info = [(p, final_elos.get(p, RANKING_ELO_START), player_fkfd.get(p, 0.0))
+                for p in players]
+        return sorted(info, key=lambda x: x[1], reverse=True)
+
+    elo_sum_a, trend_a = get_elo_features(team_a)
+    elo_sum_b, trend_b = get_elo_features(team_b)
+
+    elo_features = {
+        "ranking_elo_sum_a":      elo_sum_a,
+        "ranking_elo_sum_b":      elo_sum_b,
+        "ranking_elo_sum_diff":   elo_sum_a - elo_sum_b,
+        "ranking_elo_trend_a":    trend_a,
+        "ranking_elo_trend_b":    trend_b,
+        "ranking_elo_trend_diff": trend_a - trend_b,
+    }
+    player_info = {
+        team_a: get_player_info(team_a),
+        team_b: get_player_info(team_b),
+    }
+    return elo_features, player_info
+
+
+# ══════════════════════════════════════════════════════════════════
 # COMPUTE FEATURES FOR A SINGLE MATCHUP
 # ══════════════════════════════════════════════════════════════════
 
-def compute_match_features(team_a, team_b, map_name, team_history, feature_cols):
+def compute_match_features(team_a, team_b, map_name, team_history, feature_cols, elo_features=None):
     """
     Compute the feature row for a matchup, using each team's
     full history as the lookback.
@@ -121,6 +221,10 @@ def compute_match_features(team_a, team_b, map_name, team_history, feature_cols)
                 features[diff_col] = np.nan
             else:
                 features[diff_col] = a_val - b_val
+
+    # Merge Elo features
+    if elo_features:
+        features.update(elo_features)
 
     # Build row in the correct column order
     row = {}
@@ -181,8 +285,7 @@ def find_map(query, maps_seen):
 # PREDICTION DISPLAY
 # ══════════════════════════════════════════════════════════════════
 
-def display_prediction(team_a, team_b, map_name, prob_a, features_row,
-                       feature_cols, team_history):
+def display_prediction(team_a, team_b, map_name, prob_a, elo_features, player_info):
     """Display the prediction with context."""
     prob_b = 1 - prob_a
     confidence = max(prob_a, prob_b)
@@ -201,39 +304,29 @@ def display_prediction(team_a, team_b, map_name, prob_a, features_row,
     print(f"  {team_b:>25s}: {prob_b:.1%}")
     print(f"{'═' * 55}")
 
-    # Show key stats used
-    hist_a = team_history.get(team_a, [])
-    hist_b = team_history.get(team_b, [])
-    map_hist_a = [h for h in hist_a if h["map"] == map_name]
-    map_hist_b = [h for h in hist_b if h["map"] == map_name]
+    # Team Elo summary
+    elo_sum_a = elo_features["ranking_elo_sum_a"]
+    elo_sum_b = elo_features["ranking_elo_sum_b"]
+    trend_a   = elo_features["ranking_elo_trend_a"]
+    trend_b   = elo_features["ranking_elo_trend_b"]
 
-    print(f"\n  Data available:")
-    print(f"    {team_a}: {len(hist_a)} total maps, {len(map_hist_a)} on {map_name}")
-    print(f"    {team_b}: {len(hist_b)} total maps, {len(map_hist_b)} on {map_name}")
+    print(f"\n  {'Team Elo Summary'}")
+    print(f"  {'─' * 53}")
+    print(f"  {'':25s}  {'Elo Sum':>8}  {'Trend':>10}")
+    print(f"  {team_a:>25s}  {elo_sum_a:>8.0f}  {trend_a:>+10.1f}")
+    print(f"  {team_b:>25s}  {elo_sum_b:>8.0f}  {trend_b:>+10.1f}")
 
-    # Show key feature values
-    feat_dict = dict(zip(feature_cols, features_row.iloc[0]))
-    print(f"\n  Key stats (last 5 maps overall):")
-    for stat, label in [("acs_overall_5", "ACS"),
-                        ("kast_overall_5", "KAST"),
-                        ("fk_fd_diff_overall_5", "FK/FD Diff"),
-                        ("gun_rate_overall_5", "Gun Rate")]:
-        a_val = feat_dict.get(f"{stat}_a", np.nan)
-        b_val = feat_dict.get(f"{stat}_b", np.nan)
-        a_str = f"{a_val:.1f}" if not pd.isna(a_val) else "N/A"
-        b_str = f"{b_val:.1f}" if not pd.isna(b_val) else "N/A"
-        print(f"    {label:>12s}:  {a_str:>8s}  vs  {b_str:<8s}")
-
-    print(f"\n  Key stats (last 5 maps on {map_name}):")
-    for stat, label in [("acs_map_5", "ACS"),
-                        ("kast_map_5", "KAST"),
-                        ("fk_fd_diff_map_5", "FK/FD Diff"),
-                        ("gun_rate_map_5", "Gun Rate")]:
-        a_val = feat_dict.get(f"{stat}_a", np.nan)
-        b_val = feat_dict.get(f"{stat}_b", np.nan)
-        a_str = f"{a_val:.1f}" if not pd.isna(a_val) else "N/A"
-        b_str = f"{b_val:.1f}" if not pd.isna(b_val) else "N/A"
-        print(f"    {label:>12s}:  {a_str:>8s}  vs  {b_str:<8s}")
+    # Per-player breakdown
+    for team in [team_a, team_b]:
+        players = player_info.get(team, [])
+        print(f"\n  {team} — Players (sorted by Elo)")
+        print(f"  {'─' * 53}")
+        print(f"  {'Player':>25s}  {'Elo':>7}  {'FK/FD diff (last 5)':>19}")
+        if players:
+            for name, elo, fkfd in players:
+                print(f"  {name:>25s}  {elo:>7.0f}  {fkfd:>+19.2f}")
+        else:
+            print(f"  {'No data available':>25s}")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -251,6 +344,7 @@ def main():
     # Build team histories
     team_history, teams, maps_seen, latest_date = build_team_histories(EXCEL_FILE)
     print(f"Loaded {len(teams)} teams, data through {latest_date}")
+    print("Building player Elo ratings...")
 
     # Get input — command line or interactive
     if len(sys.argv) == 4:
@@ -279,8 +373,9 @@ def main():
         return
 
     # Compute features
+    elo_features, player_info = build_team_elo_features(team_a, team_b, EXCEL_FILE)
     features_row = compute_match_features(
-        team_a, team_b, map_name, team_history, feature_cols
+        team_a, team_b, map_name, team_history, feature_cols, elo_features
     )
 
     # Predict
@@ -289,7 +384,7 @@ def main():
     # Display
     display_prediction(
         team_a, team_b, map_name, prob_a,
-        features_row, feature_cols, team_history
+        elo_features, player_info
     )
 
 

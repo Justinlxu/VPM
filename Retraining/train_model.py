@@ -40,7 +40,7 @@ PREDICT_DIR = os.path.join(os.path.dirname(__file__), "..", "Predict")
 TEST_FRACTION = 0.20
 
 # Columns that are NOT features
-NON_FEATURE_COLS = ["date", "map", "team_a", "team_b", "target"]
+NON_FEATURE_COLS = ["date", "map", "match_id", "team_a", "team_b", "target"]
 
 # Hyperparameter search space
 PARAM_GRID = {
@@ -315,4 +315,14 @@ def main():
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", type=str, default=None,
+                        help="CSV filename (without .csv) in the Retraining folder. "
+                             "Defaults to training_data.csv")
+    args = parser.parse_args()
+
+    if args.input:
+        INPUT_FILE = os.path.join(os.path.dirname(__file__), f"{args.input}.csv")
+
     main()
