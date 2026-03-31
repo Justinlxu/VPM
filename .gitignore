@@ -3,3 +3,7 @@ __pycache__/
 *.pyo
 .env
 ~$*
+.claude/
+Agent/logs/
+Scraper/scrape_progress.json
+context.md
