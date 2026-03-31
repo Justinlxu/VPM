@@ -38,6 +38,7 @@ KEEP_FEATURES = [
     "ranking_elo_sum_diff",
     "ranking_elo_trend_diff",
     "fk_fd_diff_overall_5_diff",
+    "map_win_rate_10_diff",
 ]
 
 
@@ -92,6 +93,15 @@ def compute_fkfd_features(df):
             history     = team_history[team]
             map_history = [h for h in history if h["map"] == map_name]
 
+            # Map-specific win rate over last 10 on this map
+            recent_map = map_history[-10:] if len(map_history) >= 1 else []
+            if recent_map:
+                features[f"map_win_rate_10_{side}"] = np.mean(
+                    [h["won"] for h in recent_map]
+                )
+            else:
+                features[f"map_win_rate_10_{side}"] = np.nan
+
             for w in WINDOWS:
                 # Overall
                 recent = history[-w:] if len(history) >= w else history
@@ -115,7 +125,8 @@ def compute_fkfd_features(df):
 
         for side, team in [("a", team_a), ("b", team_b)]:
             col = "FK/FD Diff A" if side == "a" else "FK/FD Diff B"
-            team_history[team].append({"map": map_name, "fkfd": row[col]})
+            won = 1 if row["Winner"] == team else 0
+            team_history[team].append({"map": map_name, "fkfd": row[col], "won": won})
 
         if (idx + 1) % 500 == 0:
             print(f"  Processed {idx + 1} / {len(df)} rows...")

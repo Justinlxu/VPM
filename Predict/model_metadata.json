@@ -8,13 +8,14 @@
     "l2_regularization": 10.0
   },
   "metrics": {
-    "accuracy": 0.5882352941176471,
-    "log_loss": 0.6816683522745817,
-    "brier_score": 0.24407716796438456,
-    "roc_auc": 0.5952802116052239,
+    "accuracy": 0.5983772819472617,
+    "log_loss": 0.6804788742046525,
+    "brier_score": 0.2435468314092483,
+    "roc_auc": 0.5955364523061663,
     "n_test": 493.0
   },
   "feature_cols": [
+    "map_win_rate_10_diff",
     "fk_fd_diff_overall_5_diff",
     "ranking_elo_sum_diff",
     "ranking_elo_trend_diff"

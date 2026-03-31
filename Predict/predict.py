@@ -5,8 +5,8 @@ Predict the winner of a match given two team names and a map.
 Uses the trained model and computes trailing features from historical data.
 
 Usage:
-    python predict.py "Fnatic" "LOUD" "Lotus"
-    python predict.py                          # Interactive mode
+    python predict.py "Fnatic" "LOUD"
+    python predict.py                  # Interactive mode
 """
 
 import os
@@ -63,7 +63,8 @@ def build_team_histories(filepath):
 
     for _, row in df.iterrows():
         for side, team in [("a", row["Team A"]), ("b", row["Team B"])]:
-            entry = {"date": row["Date"], "map": row["Map"], "stats": {}}
+            won = 1 if row["Winner"] == team else 0
+            entry = {"date": row["Date"], "map": row["Map"], "won": won, "stats": {}}
             for stat_name, col_a, col_b in RAW_STATS:
                 col = col_a if side == "a" else col_b
                 entry["stats"][stat_name] = row[col]
@@ -238,9 +239,22 @@ def compute_match_features(team_a, team_b, map_name, team_history, feature_cols,
 # FUZZY TEAM NAME MATCHING
 # ══════════════════════════════════════════════════════════════════
 
+# Maps current VLR name -> name used in historical data (for rebrands)
+TEAM_ALIASES = {
+    "eternal fire": "ulf esports",
+}
+
+
 def find_team(query, teams):
     """Find the best matching team name. Case-insensitive partial match."""
     query_lower = query.strip().lower()
+
+    # Check aliases first (rebranded teams)
+    if query_lower in TEAM_ALIASES:
+        alias = TEAM_ALIASES[query_lower]
+        for t in teams:
+            if t.lower() == alias:
+                return t
 
     # Exact match first
     for t in teams:
@@ -279,6 +293,103 @@ def find_map(query, maps_seen):
     print(f"\n  No map found matching '{query}'.")
     print(f"  Available maps: {', '.join(maps_seen)}")
     return None
+
+
+# ══════════════════════════════════════════════════════════════════
+# ELO-ONLY PREDICTION (no map required)
+# ══════════════════════════════════════════════════════════════════
+
+def predict_elo_only(team_a, team_b, map_name=None):
+    """
+    Predict win probability for team_a vs team_b using the Elo-only model.
+
+    Parameters
+    ----------
+    team_a : str
+    team_b : str
+    map_name : str or None
+        Map being played (e.g. "Ascent"). If None, map_win_rate_10_diff is NaN.
+
+    Returns
+    -------
+    prob_a : float
+        Model's implied win probability for team_a (0–1).
+    elo_features : dict
+        Raw Elo features used (sum, trend, diff for both teams).
+    player_info : dict
+        Per-player Elo breakdown keyed by team name.
+    """
+    model = joblib.load(os.path.join(os.path.dirname(__file__), MODEL_FILE))
+    with open(os.path.join(os.path.dirname(__file__), META_FILE)) as f:
+        meta = json.load(f)
+    feature_cols = meta["feature_cols"]
+
+    team_history, teams, _, _ = build_team_histories(EXCEL_FILE)
+
+    team_a_resolved = find_team(team_a, teams) or team_a
+    team_b_resolved = find_team(team_b, teams) or team_b
+
+    elo_features, player_info = build_team_elo_features(
+        team_a_resolved, team_b_resolved, EXCEL_FILE
+    )
+
+    # Compute trailing FK/FD diff (overall, last 5 maps)
+    fkfd_features = {}
+    for side, team in [("a", team_a_resolved), ("b", team_b_resolved)]:
+        history = team_history.get(team, [])
+        recent = history[-5:] if len(history) >= 5 else history
+        if recent:
+            fkfd_features[f"fk_fd_diff_overall_5_{side}"] = np.mean(
+                [h["stats"]["fk_fd_diff"] for h in recent]
+            )
+        else:
+            fkfd_features[f"fk_fd_diff_overall_5_{side}"] = np.nan
+    a_fkfd = fkfd_features.get("fk_fd_diff_overall_5_a", np.nan)
+    b_fkfd = fkfd_features.get("fk_fd_diff_overall_5_b", np.nan)
+    if pd.isna(a_fkfd) or pd.isna(b_fkfd):
+        fkfd_features["fk_fd_diff_overall_5_diff"] = np.nan
+    else:
+        fkfd_features["fk_fd_diff_overall_5_diff"] = a_fkfd - b_fkfd
+
+    # Compute map-specific win rate over last 10 games on this map
+    map_wr_features = {}
+    if map_name:
+        for side, team in [("a", team_a_resolved), ("b", team_b_resolved)]:
+            history = team_history.get(team, [])
+            map_history = [h for h in history if h["map"] and h["map"].lower() == map_name.lower()]
+            recent = map_history[-10:] if map_history else []
+            if recent:
+                map_wr_features[f"map_win_rate_10_{side}"] = np.mean([h["won"] for h in recent])
+            else:
+                map_wr_features[f"map_win_rate_10_{side}"] = np.nan
+        a_val = map_wr_features.get("map_win_rate_10_a", np.nan)
+        b_val = map_wr_features.get("map_win_rate_10_b", np.nan)
+        if pd.isna(a_val) or pd.isna(b_val):
+            map_wr_features["map_win_rate_10_diff"] = np.nan
+        else:
+            map_wr_features["map_win_rate_10_diff"] = a_val - b_val
+
+    # Merge all features
+    all_features = {}
+    all_features.update(elo_features)
+    all_features.update(fkfd_features)
+    all_features.update(map_wr_features)
+
+    # Build row in the correct column order
+    row = {}
+    for col in feature_cols:
+        row[col] = all_features.get(col, np.nan)
+    features_row = pd.DataFrame([row])
+
+    prob_a = float(model.predict_proba(features_row)[0][1])
+
+    # Map counts so callers can check data depth
+    maps_played = {
+        team_a_resolved: len(team_history.get(team_a_resolved, [])),
+        team_b_resolved: len(team_history.get(team_b_resolved, [])),
+    }
+
+    return prob_a, elo_features, player_info, maps_played
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -334,58 +445,22 @@ def display_prediction(team_a, team_b, map_name, prob_a, elo_features, player_in
 # ══════════════════════════════════════════════════════════════════
 
 def main():
-    # Load model and metadata
-    print("Loading model and data...")
-    model = joblib.load(MODEL_FILE)
-    with open(META_FILE) as f:
-        meta = json.load(f)
-    feature_cols = meta["feature_cols"]
-
-    # Build team histories
-    team_history, teams, maps_seen, latest_date = build_team_histories(EXCEL_FILE)
-    print(f"Loaded {len(teams)} teams, data through {latest_date}")
-    print("Building player Elo ratings...")
-
     # Get input — command line or interactive
-    if len(sys.argv) == 4:
-        team_a_query, team_b_query, map_query = sys.argv[1], sys.argv[2], sys.argv[3]
+    if len(sys.argv) == 3:
+        team_a_query, team_b_query = sys.argv[1], sys.argv[2]
     else:
-        print(f"\nAvailable maps: {', '.join(maps_seen)}")
+        _, teams, _, _ = build_team_histories(EXCEL_FILE)
         print(f"Example teams: {', '.join(teams[:10])}, ...")
         print()
         team_a_query = input("  Team A: ").strip()
         team_b_query = input("  Team B: ").strip()
-        map_query = input("  Map:    ").strip()
 
-    # Resolve names
-    team_a = find_team(team_a_query, teams)
-    if not team_a:
-        return
-    team_b = find_team(team_b_query, teams)
-    if not team_b:
-        return
-    map_name = find_map(map_query, maps_seen)
-    if not map_name:
-        return
+    map_query = input("  Map (blank for none): ").strip() or None
+    prob_a, elo_features, player_info, maps_played = predict_elo_only(team_a_query, team_b_query, map_name=map_query)
 
-    if team_a == team_b:
-        print("\n  Teams must be different.")
-        return
-
-    # Compute features
-    elo_features, player_info = build_team_elo_features(team_a, team_b, EXCEL_FILE)
-    features_row = compute_match_features(
-        team_a, team_b, map_name, team_history, feature_cols, elo_features
-    )
-
-    # Predict
-    prob_a = model.predict_proba(features_row)[0][1]
-
-    # Display
-    display_prediction(
-        team_a, team_b, map_name, prob_a,
-        elo_features, player_info
-    )
+    # Resolved names are the keys of player_info
+    team_a, team_b = list(player_info.keys())[:2]
+    display_prediction(team_a, team_b, map_query or "Elo-only", prob_a, elo_features, player_info)
 
 
 if __name__ == "__main__":
