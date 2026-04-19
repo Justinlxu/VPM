@@ -11,6 +11,7 @@ Usage:
 
 import os
 import sys
+import threading
 import pandas as pd
 import numpy as np
 import joblib
@@ -27,6 +28,70 @@ from player_elo import load_player_data, build_ranking_elo, RANKING_ELO_START
 EXCEL_FILE = os.path.join(os.path.dirname(__file__), "..", "Scraper", "valorant_data.xlsx")
 MODEL_FILE = "valorant_model.joblib"
 META_FILE = "model_metadata.json"
+
+_MODEL = None
+_META = None
+
+# Elo snapshot cache: (excel_mtime, player_df, ranking_elo_history).
+# Keyed by Excel mtime so a scraper run invalidates the cache automatically.
+_elo_snapshot_cache = None
+_elo_cache_lock = threading.Lock()
+# Single-flight guard: only one build runs at a time; late arrivals wait
+# and reuse the fresh cache instead of racing their own build in parallel.
+_elo_build_lock = threading.Lock()
+
+
+def get_or_build_elo_snapshot(filepath):
+    """Return (player_df, ranking_elo_history) for the current Excel state."""
+    global _elo_snapshot_cache
+    current_mtime = os.path.getmtime(filepath)
+
+    with _elo_cache_lock:
+        if _elo_snapshot_cache and _elo_snapshot_cache[0] == current_mtime:
+            return _elo_snapshot_cache[1], _elo_snapshot_cache[2]
+
+    with _elo_build_lock:
+        with _elo_cache_lock:
+            if _elo_snapshot_cache and _elo_snapshot_cache[0] == current_mtime:
+                return _elo_snapshot_cache[1], _elo_snapshot_cache[2]
+
+        player_df = load_player_data(filepath)
+        _, ranking_elo_history, _ = build_ranking_elo(player_df)
+
+        with _elo_cache_lock:
+            _elo_snapshot_cache = (current_mtime, player_df, ranking_elo_history)
+
+    return player_df, ranking_elo_history
+
+
+def precompute_elo_snapshot(filepath=EXCEL_FILE):
+    """Fire-and-forget entry point for background Elo precompute.
+
+    Warms both the raw snapshot cache (34s build_ranking_elo) and the derived
+    struct cache (~10s team/player grouping) so the first edge check afterward
+    pays only the model + feature math.
+    """
+    try:
+        _get_derived_elo_structs(filepath)
+    except Exception:
+        pass
+
+
+def _get_model_meta():
+    """Load the trained classifier and its metadata once, then reuse.
+
+    The joblib file is a static retraining artifact — it doesn't change between
+    map predictions. Caching it avoids repeated cold-start unpickling (which
+    lazily imports sklearn and has shown pathological latency on Windows when
+    another process hits the same file concurrently). Elo features stay fresh
+    because build_ranking_elo still reads the latest Excel every call.
+    """
+    global _MODEL, _META
+    if _MODEL is None:
+        _MODEL = joblib.load(os.path.join(os.path.dirname(__file__), MODEL_FILE))
+        with open(os.path.join(os.path.dirname(__file__), META_FILE)) as f:
+            _META = json.load(f)
+    return _MODEL, _META
 
 WINDOWS = [5, 10]
 
@@ -84,49 +149,75 @@ def build_team_histories(filepath):
 ELO_TREND_WINDOW = 5
 
 
-def build_team_elo_features(team_a, team_b, filepath):
-    """
-    Compute ranking Elo sum and trend for two teams using current player Elo ratings.
-    Uses each team's most recent known lineup for the current Elo sum.
-    Trend is the slope of team Elo total over their last ELO_TREND_WINDOW maps.
-    """
-    player_df = load_player_data(filepath)
-    _, ranking_elo_history, _ = build_ranking_elo(player_df)
+def _build_derived_elo_structs(player_df, ranking_elo_history):
+    """Build final_elos, team_map_history, player_fkfd from raw snapshot.
 
-    # Final Elo ratings
+    These are team-independent and depend only on the Excel snapshot, so they
+    live in the mtime-keyed cache. Slicing player_df by Match ID 3000+ times
+    costs ~10s — doing it once per Excel version is the goal.
+    """
     final_elos = {}
     for map_id, snap in ranking_elo_history.items():
         for player, elo in snap.items():
             final_elos[player] = elo
-    # Apply final changes (last map snapshot is before, so use post-map values)
-    # Re-derive from last appearance in history
     for map_id in reversed(list(ranking_elo_history.keys())):
         snap = ranking_elo_history[map_id]
         for player in snap:
             if player not in final_elos:
                 final_elos[player] = snap[player]
 
-    # Build per-team map history: {team: [(date, match_id, [player_elos])]}
     team_map_history = defaultdict(list)
-    map_ids_ordered = player_df["Match ID"].unique()
-
-    for map_id in map_ids_ordered:
-        map_rows = player_df[player_df["Match ID"] == map_id]
+    # Group once instead of filtering per map_id (vectorized groupby).
+    for map_id, map_rows in player_df.groupby("Match ID", sort=False):
         date = map_rows["Date"].iloc[0]
         snap = ranking_elo_history.get(map_id, {})
-
-        teams_in_map = map_rows["Team"].unique()
-        for team in teams_in_map:
-            players = map_rows[map_rows["Team"] == team]["Player Name"].tolist()
+        for team, team_rows in map_rows.groupby("Team", sort=False):
+            players = team_rows["Player Name"].tolist()
             elos = [snap.get(p, RANKING_ELO_START) for p in players]
             team_map_history[team].append((date, map_id, players, elos))
 
-    # Per-player recent FK/FD diff (last 5 maps average)
     player_fkfd = {}
-    for player in player_df["Player Name"].unique():
-        rows = player_df[player_df["Player Name"] == player].tail(5)
-        if len(rows) > 0:
-            player_fkfd[player] = float((rows["FK"] - rows["FD"]).mean())
+    for player, rows in player_df.groupby("Player Name", sort=False):
+        tail = rows.tail(5)
+        if len(tail) > 0:
+            player_fkfd[player] = float((tail["FK"] - tail["FD"]).mean())
+
+    return final_elos, team_map_history, player_fkfd
+
+
+# Derived struct cache: {excel_mtime: (final_elos, team_map_history, player_fkfd)}
+_derived_cache = None
+_derived_lock = threading.Lock()
+
+
+def _get_derived_elo_structs(filepath):
+    global _derived_cache
+    current_mtime = os.path.getmtime(filepath)
+
+    with _derived_lock:
+        if _derived_cache and _derived_cache[0] == current_mtime:
+            return _derived_cache[1], _derived_cache[2], _derived_cache[3]
+
+    player_df, ranking_elo_history = get_or_build_elo_snapshot(filepath)
+
+    with _derived_lock:
+        if _derived_cache and _derived_cache[0] == current_mtime:
+            return _derived_cache[1], _derived_cache[2], _derived_cache[3]
+        final_elos, team_map_history, player_fkfd = _build_derived_elo_structs(
+            player_df, ranking_elo_history
+        )
+        _derived_cache = (current_mtime, final_elos, team_map_history, player_fkfd)
+
+    return final_elos, team_map_history, player_fkfd
+
+
+def build_team_elo_features(team_a, team_b, filepath):
+    """
+    Compute ranking Elo sum and trend for two teams using current player Elo ratings.
+    Uses each team's most recent known lineup for the current Elo sum.
+    Trend is the slope of team Elo total over their last ELO_TREND_WINDOW maps.
+    """
+    final_elos, team_map_history, player_fkfd = _get_derived_elo_structs(filepath)
 
     def get_elo_features(team):
         history = team_map_history.get(team, [])
@@ -171,7 +262,17 @@ def build_team_elo_features(team_a, team_b, filepath):
         team_a: get_player_info(team_a),
         team_b: get_player_info(team_b),
     }
-    return elo_features, player_info
+
+    # Build full player→(team, elo) map using each player's most recent team
+    all_player_elos = {}
+    for team, history in team_map_history.items():
+        if not history:
+            continue
+        _, _, players, _ = history[-1]  # most recent lineup
+        for p in players:
+            all_player_elos[p] = (team, final_elos.get(p, RANKING_ELO_START))
+
+    return elo_features, player_info, all_player_elos
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -239,9 +340,16 @@ def compute_match_features(team_a, team_b, map_name, team_history, feature_cols,
 # FUZZY TEAM NAME MATCHING
 # ══════════════════════════════════════════════════════════════════
 
-# Maps current VLR name -> name used in historical data (for rebrands)
+# Query-name -> canonical-name (lowercase on both sides).
+# Dataset was consolidated to the newer sponsor name per team on 2026-04-18,
+# so these aliases only matter if a caller passes the old (pre-rebrand) name.
 TEAM_ALIASES = {
-    "eternal fire": "ulf esports",
+    "ulf esports": "eternal fire",
+    "drx": "kiwoom drx",
+    "koi": "movistar koi",
+    "jdg esports": "jd mall jdg esports",
+    "bilibili gaming": "guangzhou huadu bilibili gaming",
+    "titan esports club": "wuxi titan esports club",
 }
 
 
@@ -318,10 +426,12 @@ def predict_elo_only(team_a, team_b, map_name=None):
         Raw Elo features used (sum, trend, diff for both teams).
     player_info : dict
         Per-player Elo breakdown keyed by team name.
+    maps_played : dict
+        {team: int} number of maps in dataset per team.
+    all_player_elos : dict
+        {player: (team, elo)} for every player on their most recent team.
     """
-    model = joblib.load(os.path.join(os.path.dirname(__file__), MODEL_FILE))
-    with open(os.path.join(os.path.dirname(__file__), META_FILE)) as f:
-        meta = json.load(f)
+    model, meta = _get_model_meta()
     feature_cols = meta["feature_cols"]
 
     team_history, teams, _, _ = build_team_histories(EXCEL_FILE)
@@ -329,7 +439,7 @@ def predict_elo_only(team_a, team_b, map_name=None):
     team_a_resolved = find_team(team_a, teams) or team_a
     team_b_resolved = find_team(team_b, teams) or team_b
 
-    elo_features, player_info = build_team_elo_features(
+    elo_features, player_info, all_player_elos = build_team_elo_features(
         team_a_resolved, team_b_resolved, EXCEL_FILE
     )
 
@@ -389,7 +499,7 @@ def predict_elo_only(team_a, team_b, map_name=None):
         team_b_resolved: len(team_history.get(team_b_resolved, [])),
     }
 
-    return prob_a, elo_features, player_info, maps_played
+    return prob_a, elo_features, player_info, maps_played, all_player_elos
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -456,7 +566,7 @@ def main():
         team_b_query = input("  Team B: ").strip()
 
     map_query = input("  Map (blank for none): ").strip() or None
-    prob_a, elo_features, player_info, maps_played = predict_elo_only(team_a_query, team_b_query, map_name=map_query)
+    prob_a, elo_features, player_info, maps_played, _all_elos = predict_elo_only(team_a_query, team_b_query, map_name=map_query)
 
     # Resolved names are the keys of player_info
     team_a, team_b = list(player_info.keys())[:2]
