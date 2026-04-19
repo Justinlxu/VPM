@@ -7,3 +7,4 @@ __pycache__/
 Agent/logs/
 Scraper/scrape_progress.json
 context.md
+codebaseInventory.md
