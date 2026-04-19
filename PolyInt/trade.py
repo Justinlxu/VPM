@@ -159,6 +159,10 @@ class PolyTrader:
     # ORDER MANAGEMENT
     # ══════════════════════════════════════════════════════════════
 
+    def get_order(self, order_id):
+        """Get a single order's status and fill info."""
+        return self.client.get_order(order_id)
+
     def cancel(self, order_id):
         """Cancel a single order by ID."""
         return self.client.cancel(order_id)
@@ -170,6 +174,15 @@ class PolyTrader:
     def get_open_orders(self):
         """Return list of all open orders."""
         return self.client.get_orders()
+
+    def get_trades_for_order(self, order_id):
+        """
+        Get trades associated with a specific order.
+        Returns list of trade dicts with 'price' and 'size' fields.
+        """
+        from py_clob_client.clob_types import TradeParams
+        trades = self.client.get_trades(TradeParams(id=order_id))
+        return trades
 
     # ══════════════════════════════════════════════════════════════
     # POSITIONS & BALANCE
@@ -196,7 +209,7 @@ class PolyTrader:
 
         Returns
         -------
-        float : number of shares held
+        float : number of shares held (in normal units, not raw)
         """
         from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
         params = BalanceAllowanceParams(
@@ -204,7 +217,19 @@ class PolyTrader:
             token_id=token_id,
         )
         resp = self.client.get_balance_allowance(params)
-        return float(resp.get("balance", 0))
+        return float(resp.get("balance", 0)) / 1e6
+
+    def approve_token(self, token_id):
+        """
+        Approve conditional token for trading (required before selling).
+        Must be called after buying tokens to enable sells.
+        """
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        params = BalanceAllowanceParams(
+            asset_type=AssetType.CONDITIONAL,
+            token_id=token_id,
+        )
+        return self.client.update_balance_allowance(params)
 
     # ══════════════════════════════════════════════════════════════
     # PRICE QUERIES
@@ -230,9 +255,9 @@ class PolyTrader:
         best_ask = None
 
         if book.bids:
-            best_bid = float(book.bids[0].price)
+            best_bid = max(float(b.price) for b in book.bids)
         if book.asks:
-            best_ask = float(book.asks[0].price)
+            best_ask = min(float(a.price) for a in book.asks)
 
         mid = None
         if best_bid is not None and best_ask is not None:
@@ -251,6 +276,23 @@ class PolyTrader:
             "last_trade": last_trade,
             "mid": mid,
         }
+
+    def get_last_trade(self, token_id):
+        """
+        Get the last trade price for a specific token via the dedicated endpoint.
+
+        Unlike get_order_book().last_trade_price (which is market-level and
+        returns the same value for both tokens), this endpoint is per-token.
+
+        Returns
+        -------
+        float or None
+        """
+        try:
+            resp = self.client.get_last_trade_price(token_id)
+            return float(resp.get("price", 0)) or None
+        except Exception:
+            return None
 
     def get_midpoint(self, token_id):
         """Get the mid-market price for a token. Returns float or None."""

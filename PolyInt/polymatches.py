@@ -92,12 +92,13 @@ def _parse_event_title(title):
 # GAMMA API
 # ══════════════════════════════════════════════════════════════
 
+
 def fetch_valorant_events(active_only=True):
     """
     Fetch all Valorant events from the Gamma API (tag_slug=esports, filter by title).
     Returns list of event dicts that have Valorant in the title.
     """
-    params = {"tag_slug": "esports", "limit": 200}
+    params = {"tag_slug": "esports", "limit": 500}
     if active_only:
         params["active"] = "true"
         params["closed"] = "false"
@@ -189,21 +190,32 @@ def get_match_prices(team_a, team_b, verbose=False):
     if verbose:
         print(f"\nMatched: '{event_title}'  (score={best_score:.2f}, swapped={best_swapped})")
 
-    # ── Find map markets (inline in event["markets"]) ──
+    # ── Find map markets and moneyline (inline in event["markets"]) ──
     map_markets = {}
+    moneyline_market = None
     for market in best_event.get("markets", []):
         if market.get("closed", False):
             continue
         question = market.get("question", "")
         q_lower  = question.lower()
+
+        # Map-specific markets
+        found_map = False
         for n in [1, 2, 3]:
             if f"map {n} winner" in q_lower and n not in map_markets:
                 map_markets[n] = market
+                found_map = True
                 break
 
-    if not map_markets:
+        # Moneyline / series winner — matches event title, exclude props
+        if (not found_map and "map" not in q_lower
+                and "o/u" not in q_lower and "handicap" not in q_lower
+                and "total" not in q_lower):
+            moneyline_market = market
+
+    if not map_markets and moneyline_market is None:
         if verbose:
-            print("No open map markets found in this event")
+            print("No open markets found in this event")
         return None
 
     # ── Build result ──
@@ -214,55 +226,80 @@ def get_match_prices(team_a, team_b, verbose=False):
         "team_b":      poly_b,
         "swapped":     best_swapped,
         "maps":        {},
+        "moneyline":   None,
     }
 
-    for map_num in sorted(map_markets):
-        market = map_markets[map_num]
+    def _parse_market_prices(market, use_outcome_prices=False):
+        """Extract price_a, price_b from a market dict. Returns (price_a, price_b) or None."""
         try:
             import json
             outcomes = json.loads(market.get("outcomes", "[]"))
         except (ValueError, TypeError):
-            continue
-
+            return None
         if len(outcomes) < 2:
-            continue
+            return None
 
-        # Use bestAsk (what you'd actually pay to buy each side).
-        # Market is for outcome 0 (team listed first in Polymarket title).
-        # bestAsk = price to buy outcome 0, bestBid = price to sell outcome 0.
-        # For outcome 1: buy price = 1 - bestBid of outcome 0.
-        best_ask = float(market.get("bestAsk", 0))
-        best_bid = float(market.get("bestBid", 0))
-
-        if best_ask <= 0 or best_bid <= 0:
-            # Fall back to outcomePrices if order book is empty
+        if use_outcome_prices:
+            # Use outcomePrices (midpoint per outcome) — coherent for wide-spread markets
             try:
                 prices = [float(p) for p in json.loads(market.get("outcomePrices", "[]"))]
             except (ValueError, TypeError):
-                continue
+                return None
             if len(prices) < 2:
-                continue
+                return None
             price_a, price_b = prices[0], prices[1]
         else:
-            # bestAsk = cost to buy team A, 1 - bestBid = cost to buy team B
-            price_a = best_ask
-            price_b = round(1.0 - best_bid, 4)
+            best_ask = float(market.get("bestAsk", 0))
+            best_bid = float(market.get("bestBid", 0))
 
-        # If we swapped teams, also swap prices.
+            if best_ask <= 0 or best_bid <= 0:
+                try:
+                    prices = [float(p) for p in json.loads(market.get("outcomePrices", "[]"))]
+                except (ValueError, TypeError):
+                    return None
+                if len(prices) < 2:
+                    return None
+                price_a, price_b = prices[0], prices[1]
+            else:
+                price_a = best_ask
+                price_b = round(1.0 - best_bid, 4)
+
         if best_swapped:
-            outcomes = [outcomes[1], outcomes[0]]
             price_a, price_b = price_b, price_a
+
+        return round(price_a, 4), round(price_b, 4)
+
+    for map_num in sorted(map_markets):
+        market = map_markets[map_num]
+        parsed = _parse_market_prices(market)
+        if parsed is None:
+            continue
+        price_a, price_b = parsed
 
         result["maps"][map_num] = {
             "market_id":    str(market.get("id", "")),
             "condition_id": market.get("conditionId", ""),
             "question":     market.get("question", ""),
-            "price_a":      round(price_a, 4),
-            "price_b":      round(price_b, 4),
+            "price_a":      price_a,
+            "price_b":      price_b,
         }
 
         if verbose:
             print(f"  Map {map_num}: {poly_a} {price_a:.1%}  {poly_b} {price_b:.1%}")
+
+    if moneyline_market:
+        parsed = _parse_market_prices(moneyline_market)
+        if parsed:
+            price_a, price_b = parsed
+            result["moneyline"] = {
+                "market_id":    str(moneyline_market.get("id", "")),
+                "condition_id": moneyline_market.get("conditionId", ""),
+                "question":     moneyline_market.get("question", ""),
+                "price_a":      price_a,
+                "price_b":      price_b,
+            }
+            if verbose:
+                print(f"  Moneyline: {poly_a} {price_a:.1%}  {poly_b} {price_b:.1%}")
 
     return result
 
