@@ -24,6 +24,19 @@ from config import (
 )
 
 
+_PAREN_SUFFIX_RE = re.compile(r"\s*\([^)]*\)\s*$")
+
+
+def _clean_team_name(raw):
+    """Collapse internal whitespace, strip, and drop VLR's trailing short-name
+    suffix (e.g. 'KIWOOM DRX\\t\\t...\\n\\t\\t(DRX)' → 'KIWOOM DRX')."""
+    if not raw:
+        return ""
+    collapsed = re.sub(r"\s+", " ", raw).strip()
+    collapsed = _PAREN_SUFFIX_RE.sub("", collapsed).strip()
+    return collapsed
+
+
 class VLRScraper:
     BASE_URL = "https://www.vlr.gg"
 
@@ -191,13 +204,13 @@ class VLRScraper:
     def _parse_team_names(self, soup):
         names = []
         for el in soup.select(".match-header-link-name .wf-title-med"):
-            name = el.text.strip()
+            name = _clean_team_name(el.text)
             if name:
                 names.append(name)
         if len(names) < 2:
             # Fallback: try different selector
             for el in soup.select(".match-header-link-name div"):
-                name = el.text.strip()
+                name = _clean_team_name(el.text)
                 if name and name not in names:
                     names.append(name)
         return names[:2]

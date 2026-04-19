@@ -17,7 +17,7 @@ import argparse
 import os
 import time
 from config import EVENTS, OUTPUT_FILE, PROGRESS_FILE, SAVE_EVERY
-from scraper import VLRScraper
+from completed import VLRScraper
 from excel_writer import (
     load_or_create_workbook, write_match_data,
     save_workbook, print_summary, derive_features_from_rounds
