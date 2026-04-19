@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from Agent.agent import (
     quarter_kelly, compute_floor, compute_stop_loss,
-    EDGE_THRESHOLD, TRAILING_FLOORS, log_trade,
+    EDGE_THRESHOLD, TRAILING_FLOOR_START, TRAILING_FLOOR_STEP, log_trade,
     DRYRUN_TRADE_LOG, DRYRUN_AGENT_LOG,
     logger as agent_logger,
 )
@@ -96,7 +96,6 @@ def simulate_one(team_a, team_b, prob_a, market_price_a=None,
         "position_size_usd": f"{position_usd:.2f}",
         "entry_price": f"{entry_price:.4f}",
         "exit_price": "", "exit_reason": "open", "pnl": "",
-        "map_winner": "", "model_correct": "",
     })
 
     # Simulate price path
@@ -152,7 +151,6 @@ def simulate_one(team_a, team_b, prob_a, market_price_a=None,
         "exit_price": f"{exit_price:.4f}",
         "exit_reason": exit_reason,
         "pnl": f"{pnl:.2f}",
-        "map_winner": "", "model_correct": "",
     })
 
     return {
@@ -395,7 +393,7 @@ def run_single(team_a_query, team_b_query, market_price_override=None):
     print(f"  Team B: {team_b}")
 
     print("\n[2/6] Running Elo model...")
-    prob_a, elo_features, player_info, maps_played = predict_elo_only(team_a, team_b)
+    prob_a, elo_features, player_info, maps_played, _all_elos = predict_elo_only(team_a, team_b)
     prob_b = 1 - prob_a
     print(f"  {team_a}: {prob_a:.1%}")
     print(f"  {team_b}: {prob_b:.1%}")
@@ -439,9 +437,10 @@ def run_single(team_a_query, team_b_query, market_price_override=None):
     print(f"  Shares: {shares:.1f} @ {entry_price:.4f}")
     print(f"  Stop loss at: {compute_stop_loss(entry_price):.4f}")
     print(f"  Trailing floors:")
-    for thresh, offset in TRAILING_FLOORS:
-        floor_price = entry_price * (1 + offset)
+    for pct in range(int(TRAILING_FLOOR_START * 100), int(TRAILING_FLOOR_START * 100) + 40, int(TRAILING_FLOOR_STEP * 100)):
+        thresh = pct / 100
         trigger_price = entry_price * (1 + thresh)
+        floor_price = compute_floor(entry_price, trigger_price)
         print(f"    +{thresh:.0%} gain ({trigger_price:.4f}) -> floor at {floor_price:.4f}")
 
     result = simulate_one(team_a, team_b, prob_a,

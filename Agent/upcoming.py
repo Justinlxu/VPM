@@ -9,9 +9,10 @@ Usage:
     matches = get_upcoming_matches()
 """
 
+import re
 import time
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
 
 BASE_URL = "https://www.vlr.gg"
@@ -93,6 +94,24 @@ def get_upcoming_matches(max_pages=3, vct_only=True):
     return unique
 
 
+def _parse_relative_eta(text):
+    """Convert a relative ETA string like '5h 20m', '1d 5h', or '1w 2d' to a UTC datetime."""
+    total = timedelta()
+    for value, unit in re.findall(r"(\d+)\s*(w|d|h|m)", text):
+        value = int(value)
+        if unit == "w":
+            total += timedelta(weeks=value)
+        elif unit == "d":
+            total += timedelta(days=value)
+        elif unit == "h":
+            total += timedelta(hours=value)
+        elif unit == "m":
+            total += timedelta(minutes=value)
+    if total == timedelta():
+        return None
+    return datetime.now(timezone.utc) + total
+
+
 def _parse_matches_page(soup):
     matches = []
 
@@ -108,18 +127,19 @@ def _parse_matches_page(soup):
         match_id = parts[0]
         match_url = f"{BASE_URL}{href}" if href.startswith("/") else href
 
-        # Skip completed matches (have numeric scores on both sides)
-        score_spans = link.select(".match-item-vs-team-score")
-        has_score = any(s.text.strip().isdigit() for s in score_spans)
-        if has_score:
-            continue
-
         # Detect live vs upcoming
         eta = link.select_one(".match-item-eta")
         eta_text = eta.text.strip().lower() if eta else ""
         is_live = "live" in eta_text
         if "ago" in eta_text:
             continue  # Recently ended, skip
+
+        # Skip completed matches (have numeric scores) — but keep live matches
+        if not is_live:
+            score_spans = link.select(".match-item-vs-team-score")
+            has_score = any(s.text.strip().isdigit() for s in score_spans)
+            if has_score:
+                continue
 
         # Team names
         team_divs = link.select(".match-item-vs-team-name")
@@ -130,18 +150,26 @@ def _parse_matches_page(soup):
         if not team_a or not team_b or "tbd" in team_a.lower() or "tbd" in team_b.lower():
             continue
 
-        # Start time from UTC timestamp attribute
+        # Start time -- prefer the relative ETA (.ml-eta) because VLR updates
+        # it dynamically when the previous match runs long or ends early.
+        # .moment-tz-convert is the originally scheduled time and goes stale.
         start_time = None
-        ts_el = link.select_one(".moment-tz-convert")
-        if ts_el:
-            raw_ts = ts_el.get("data-utc-ts", "")
-            if raw_ts:
-                try:
-                    start_time = datetime.strptime(raw_ts, "%Y-%m-%d %H:%M:%S").replace(
-                        tzinfo=timezone.utc
-                    )
-                except ValueError:
-                    pass
+        if not is_live:
+            ml_eta = link.select_one(".ml-eta")
+            if ml_eta:
+                start_time = _parse_relative_eta(ml_eta.text.strip())
+
+        if start_time is None:
+            ts_el = link.select_one(".moment-tz-convert")
+            if ts_el:
+                raw_ts = ts_el.get("data-utc-ts", "")
+                if raw_ts:
+                    try:
+                        start_time = datetime.strptime(raw_ts, "%Y-%m-%d %H:%M:%S").replace(
+                            tzinfo=timezone.utc
+                        )
+                    except ValueError:
+                        pass
 
         # Event name and stage.
         # VLR structure inside .match-item-event:
@@ -180,7 +208,7 @@ if __name__ == "__main__":
     label = "VCT only" if vct_only else "all events"
     print(f"Found {len(matches)} upcoming matches ({label}):\n")
     for m in matches:
-        ts = m["start_time"].strftime("%Y-%m-%d %H:%M UTC") if m["start_time"] else "unknown time"
+        ts = m["start_time"].astimezone().strftime("%Y-%m-%d %H:%M %Z") if m["start_time"] else "unknown time"
         live = "  [LIVE]" if m["is_live"] else ""
         print(f"  {m['team_a']} vs {m['team_b']}{live}")
         print(f"    {ts}  |  {m['event']}" + (f" — {m['stage']}" if m["stage"] else ""))

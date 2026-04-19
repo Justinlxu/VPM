@@ -36,7 +36,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from Agent.agent import (
     TradingAgent, quarter_kelly, compute_floor, compute_stop_loss,
-    EDGE_THRESHOLD, TRAILING_FLOORS, TRADE_CSV_FIELDS,
+    EDGE_THRESHOLD, TRAILING_FLOOR_START, TRAILING_FLOOR_STEP, TRADE_CSV_FIELDS,
     logger as agent_logger,
 )
 
@@ -64,7 +64,7 @@ def _make_scenario_2_1():
         # Simulated price paths for the price monitor (per map)
         # Each list is a sequence of prices the monitor sees over time
         "price_paths": {
-            1: _rising_then_drop(entry=0.55, peak=0.66, drop_to=0.58),
+            1: _rising_then_drop(entry=0.55, peak=0.75, drop_to=0.60),
             2: _falling(entry=0.52, bottom=0.35),
             3: [],  # no position, no prices needed
         },
@@ -122,8 +122,8 @@ def _make_scenario_2_0():
             2: {"price_a": 0.60, "price_b": 0.40},   # 8% edge
         },
         "price_paths": {
-            1: _rising_then_drop(entry=0.58, peak=0.72, drop_to=0.62),
-            2: _rising_then_drop(entry=0.60, peak=0.78, drop_to=0.65),
+            1: _rising_then_drop(entry=0.58, peak=0.78, drop_to=0.63),
+            2: _rising_then_drop(entry=0.60, peak=0.80, drop_to=0.65),
         },
         "poller_sequence": [
             {"is_live": False, "is_final": False, "maps": {}},
@@ -272,7 +272,8 @@ def build_mocks(state):
         }
         elo_features = {"ranking_elo_sum_diff": 50, "ranking_elo_trend_diff": 5}
         maps_played = {team_a: 50, team_b: 50}
-        return prob_a, elo_features, player_info, maps_played
+        all_player_elos = {f"p{i}": (team_a if i <= 5 else team_b, 1000.0) for i in range(1, 11)}
+        return prob_a, elo_features, player_info, maps_played, all_player_elos
 
     # -- Mock Polymarket prices --
     def mock_get_match_prices(team_a, team_b, verbose=False):
@@ -377,6 +378,8 @@ def run_simulation(scenario_name="2-1", verbose=False):
         patch("Agent.agent.time.sleep", side_effect=lambda _: _real_sleep(0.005)),
         # Patch os.system to skip actual scraping
         patch("os.system", side_effect=lambda cmd: state.log(f"scrape: {cmd}")),
+        # Suppress Discord notifications during tests
+        patch("Agent.agent.notify", side_effect=lambda msg: None),
     ]
 
     for p in patches:

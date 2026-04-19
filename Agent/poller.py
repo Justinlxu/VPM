@@ -61,6 +61,30 @@ def poll_match_status(match_url, session=None):
     return _parse_match_page(soup)
 
 
+def _parse_veto_picks(soup):
+    """Extract map picks in order from VLR's veto summary text.
+
+    VLR posts the full veto sequence in .match-header-note as soon as veto
+    completes — well before .vm-stats-game sections get real map names.
+    Format: "TeamA ban X; TeamB ban Y; TeamA pick Map1; TeamB pick Map2;
+             TeamA ban Z; TeamB ban W; Map3 remains"
+    Returns a list of map names in map-number order, or [] if no veto yet.
+    """
+    el = soup.select_one(".match-header-note")
+    if not el:
+        return []
+    text = el.text.strip()
+    picks = []
+    for part in text.split(";"):
+        part = part.strip()
+        low = part.lower()
+        if " pick " in low:
+            picks.append(part.split(" pick ", 1)[1].strip())
+        elif low.endswith(" remains"):
+            picks.append(part[: -len(" remains")].strip())
+    return picks
+
+
 def _parse_match_page(soup):
     # ── Match-level live / final status ──────────────────────
     # VLR shows a note near the match header: "LIVE", "final", or nothing
@@ -77,6 +101,10 @@ def _parse_match_page(soup):
 
     # Fallback: if any map has a score, the match has started
     # (catches cases where the note element has a different class)
+
+    # Veto picks in map order (used as the primary source for map_name since
+    # .vm-stats-game .map span shows "TBD" until the map actually loads in-game)
+    veto_picks = _parse_veto_picks(soup)
 
     # ── Per-map scores ────────────────────────────────────────
     maps = {}
@@ -100,6 +128,13 @@ def _parse_match_page(soup):
         # Clean up: sometimes the text includes extra info like "PICK"
         if map_name and "\n" in map_name:
             map_name = map_name.split("\n")[0].strip()
+        # Treat placeholder text as no map name
+        if map_name and map_name.lower() in ("tbd", "tba"):
+            map_name = None
+        # Fall back to the veto pick for this map if the section hasn't
+        # populated yet (happens pre-match and during early map loading)
+        if not map_name and len(veto_picks) >= game_number:
+            map_name = veto_picks[game_number - 1]
 
         scores = section.select(".score")
         score_a, score_b = 0, 0
@@ -110,12 +145,10 @@ def _parse_match_page(soup):
             except ValueError:
                 pass
 
-        # A map is final when one team has reached a winning score.
-        # In Valorant, standard maps go to 13 (or 7 in OT); BO5 same rules.
-        final = (score_a >= 13 or score_b >= 13) or (
-            # Overtime: 13-13 resolved by 2-point lead
-            score_a + score_b > 24 and abs(score_a - score_b) >= 2
-        )
+        # A map is final when one team reaches 13+ AND leads by at least 2.
+        # Regulation: 13-X where X <= 11. Overtime: 12-12, then first to 2-round lead.
+        high = max(score_a, score_b)
+        final = high >= 13 and abs(score_a - score_b) >= 2
 
         maps[game_number] = {
             "final":    final,
@@ -130,9 +163,10 @@ def _parse_match_page(soup):
         if any_scores:
             is_live = True
 
-    # Series is final when 2 maps are final (2-0) or 3 maps are final (2-1)
-    final_count = sum(1 for m in maps.values() if m["final"])
-    if final_count >= 2:
+    # Series is final when one team has won 2 maps (Bo3)
+    wins_a = sum(1 for m in maps.values() if m["final"] and m["score_a"] > m["score_b"])
+    wins_b = sum(1 for m in maps.values() if m["final"] and m["score_b"] > m["score_a"])
+    if wins_a >= 2 or wins_b >= 2:
         is_final = True
 
     return {

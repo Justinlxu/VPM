@@ -19,11 +19,18 @@ import os
 import sys
 import csv
 import json
+import math
 import time
+import sqlite3
 import logging
 import argparse
 import threading
+import requests
 from datetime import datetime, timezone, timedelta
+
+# Load .env from project root
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 # Project imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -31,7 +38,7 @@ from Agent.upcoming import get_upcoming_matches
 from Agent.poller import poll_match_status
 from PolyInt.polymatches import get_match_prices
 from PolyInt.trade import PolyTrader
-from Predict.predict import predict_elo_only
+from Predict.predict import predict_elo_only, precompute_elo_snapshot, EXCEL_FILE as _PREDICT_EXCEL
 
 # ══════════════════════════════════════════════════════════════
 # CONFIG
@@ -39,19 +46,31 @@ from Predict.predict import predict_elo_only
 
 EDGE_THRESHOLD = 0.05          # 5% minimum edge to enter
 MAX_CONFIDENCE = 0.70          # cap model probability at 70% (either side)
-STOP_LOSS_PCT = -0.30          # -30% emergency stop loss
-TRAILING_FLOORS = [            # (gain_threshold, floor_relative_to_entry)
-    (0.30, 0.20),              # +30% gain → floor at +20%
-    (0.20, 0.10),              # +20% gain → floor at +10%
-    (0.10, 0.00),              # +10% gain → floor at entry (breakeven)
-]
+STOP_LOSS_PCT = None           # disabled -- set to e.g. -0.30 to re-enable
+# Trailing floor ladder: (gain_threshold, floor_offset) pairs.
+# Activates early (+16%) with tight gaps to capture the model's decaying edge
+# and salvage wrong trades during temporary price spikes.  Past the last
+# explicit tier, the floor tracks in 6% steps.
+TRAILING_FLOOR_LADDER = (
+    (0.16, 0.09),   # +16% peak → floor +9%  (gap 7%)
+    (0.27, 0.21),   # +27% peak → floor +21% (gap 6%)
+    (0.38, 0.34),   # +38% peak → floor +34% (gap 4%)
+)
+TRAILING_FLOOR_START = TRAILING_FLOOR_LADDER[0][0]
+TRAILING_FLOOR_STEP = 0.06     # ladder granularity past the last explicit tier
 ENTRY_WINDOW_SECS = 5 * 60    # 5 min entry window for maps 2/3
 COOLDOWN_SECS = 5 * 60         # 5 min cooldown after map final
+POST_MATCH_REPOLL_DELAY = 5 * 60  # wait 5 min after a match ends before repolling (VLR ETA lag)
 PRE_MATCH_LEAD = 10 * 60       # wake up 10 min before match
-ENTRY_LEAD = 5 * 60            # entry opens 5 min before match start
 POLL_INTERVAL = 60              # VLR poll interval (seconds)
-PRICE_MONITOR_INTERVAL = 3     # price check interval (seconds)
+PRICE_MONITOR_INTERVAL = 1     # price check interval (seconds)
+FILL_POLL_INTERVAL = 2         # order fill check interval (seconds)
+FILL_POLL_TIMEOUT = 30         # max seconds to wait for a fill
+MIN_CLOB_SHARES = 5            # Polymarket minimum order size in shares
+MIN_BUY_SHARES = 5.25          # Buy above 5 so post-fee balance stays >= MIN_CLOB_SHARES
 DEFAULT_PAPER_BANKROLL = 1000  # $1000 default paper bankroll
+
+DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
 STATE_FILE = os.path.join(LOG_DIR, "agent_state.json")
@@ -59,6 +78,7 @@ TRADE_LOG = os.path.join(LOG_DIR, "trades.csv")
 AGENT_LOG = os.path.join(LOG_DIR, "trades.log")
 PAPER_TRADE_LOG = os.path.join(LOG_DIR, "papertrades.csv")
 PAPER_AGENT_LOG = os.path.join(LOG_DIR, "papertrades.log")
+DB_FILE = os.path.join(LOG_DIR, "agent.db")
 DRYRUN_TRADE_LOG = os.path.join(LOG_DIR, "dryruntrades.csv")
 DRYRUN_AGENT_LOG = os.path.join(LOG_DIR, "dryruntrades.log")
 
@@ -74,7 +94,6 @@ TRADE_CSV_FIELDS = [
     "model_prob", "market_price", "edge",
     "kelly_pct", "position_size_usd",
     "entry_price", "exit_price", "exit_reason", "pnl",
-    "map_winner", "model_correct",
 ]
 
 # Default logger (reconfigured per-instance in TradingAgent.__init__)
@@ -88,9 +107,12 @@ logger.addHandler(ch)
 # Active trade log path (set by TradingAgent based on mode)
 _active_trade_log = TRADE_LOG
 
+# Module-level reference to agent instance for SQLite writes (set by TradingAgent.__init__)
+_agent_instance = None
+
 
 def log_trade(row):
-    """Append a row to the active trade CSV (trades.csv or papertrades.csv)."""
+    """Append a row to the active trade CSV and SQLite trades table."""
     path = _active_trade_log
     file_exists = os.path.exists(path)
     with open(path, "a", newline="", encoding="utf-8") as f:
@@ -98,6 +120,23 @@ def log_trade(row):
         if not file_exists:
             writer.writeheader()
         writer.writerow(row)
+
+    # Also write to SQLite
+    if _agent_instance is not None:
+        try:
+            _agent_instance._record_trade(row)
+        except Exception:
+            pass
+
+
+def notify(msg):
+    """Send a Discord notification via webhook. Fails silently."""
+    if not DISCORD_WEBHOOK:
+        return
+    try:
+        requests.post(DISCORD_WEBHOOK, json={"content": msg}, timeout=5)
+    except Exception:
+        pass
 
 
 # ══════════════════════════════════════════════════════════════
@@ -132,23 +171,42 @@ def compute_floor(entry_price, high_price):
     """
     Compute the current exit floor based on entry price and highest price seen.
 
-    Returns the floor price, or None if only stop loss applies.
+    Uses TRAILING_FLOOR_LADDER for the explicit tiers (+30% through +60%), then
+    tracks in 10% steps with a 10% gap past the last explicit tier. The ladder
+    tightens as the trade deepens because per-round price volatility scales with
+    p*(1-p) — a round swing near 0.50 is ~8c, near 0.80 is ~4c, near 0.90 is ~2c,
+    so a tighter gap at high tiers is matched to the lower volatility there.
+
+    Returns the floor price, or None if gain hasn't reached the first tier.
     """
     if entry_price <= 0:
         return None
 
-    gain_pct = round((high_price - entry_price) / entry_price, 8)
+    gain_pct = (high_price - entry_price) / entry_price
 
-    for threshold, floor_offset in TRAILING_FLOORS:
-        if gain_pct >= threshold:
-            return entry_price * (1 + floor_offset)
+    if gain_pct < TRAILING_FLOOR_START:
+        return None
 
-    # Below +10% — no trailing floor, only stop loss
-    return None
+    eps = 1e-9
+    floor_offset = None
+    for threshold, offset in TRAILING_FLOOR_LADDER:
+        if gain_pct + eps >= threshold:
+            floor_offset = offset
+        else:
+            break
+
+    last_threshold, last_offset = TRAILING_FLOOR_LADDER[-1]
+    if gain_pct + eps >= last_threshold + TRAILING_FLOOR_STEP:
+        extra_tiers = int((gain_pct - last_threshold + eps) / TRAILING_FLOOR_STEP)
+        floor_offset = last_offset + extra_tiers * TRAILING_FLOOR_STEP
+
+    return entry_price * (1 + floor_offset)
 
 
 def compute_stop_loss(entry_price):
-    """Compute the -30% stop loss price."""
+    """Compute the stop loss price, or None if disabled."""
+    if STOP_LOSS_PCT is None:
+        return None
     return entry_price * (1 + STOP_LOSS_PCT)
 
 
@@ -158,7 +216,7 @@ def compute_stop_loss(entry_price):
 
 class TradingAgent:
     def __init__(self, paper=True, bankroll=DEFAULT_PAPER_BANKROLL):
-        global _active_trade_log
+        global _active_trade_log, _agent_instance
 
         self.paper = paper
         self.mode = "paper" if paper else "live"
@@ -192,12 +250,198 @@ class TradingAgent:
         self.positions = {}
         self._positions_lock = threading.Lock()
 
+
+        # Balance lock: prevents concurrent entries from double-spending
+        self._balance_lock = threading.Lock()
+
+        # Active match threads: match_id -> Thread
+        self._active_matches = {}
+        self._active_matches_lock = threading.Lock()
+
+        # Event to wake the main loop when a match thread finishes
+        self._match_done = threading.Event()
+
+        # Pending entry order IDs: map_num -> order_id (for targeted cancellation)
+        self._pending_entry_orders = {}
+
         # Restore state from previous run (if any)
         self._load_state()
 
         # Price monitor thread
         self._monitor_running = False
         self._monitor_thread = None
+
+        # Price watchers: keep recording ticks after position exit until map resolves
+        # {pos_key: {"match_id", "map_num", "token_id", "side"}}
+        self._price_watchers = {}
+
+        # SQLite database
+        self._init_db()
+        _agent_instance = self
+
+        # Pre-warm the joblib model so the first edge check doesn't pay the
+        # cold-unpickle cost. On Windows this can stall for minutes when AV
+        # scans sklearn DLLs or the dashboard process hits the same file.
+        from Predict.predict import _get_model_meta
+        _preload_start = time.time()
+        _get_model_meta()
+        logger.info(f"Model pre-loaded in {time.time()-_preload_start:.1f}s")
+
+    # ──────────────────────────────────────────────────────────
+    # SQLITE PRICE TICK DB
+    # ──────────────────────────────────────────────────────────
+
+    def _init_db(self):
+        """Create the SQLite database and price_ticks table if needed."""
+        # WAL mode lets the Dashboard's read-only connections coexist with the
+        # agent's writes without blocking. Busy timeout bounds how long any
+        # individual SQLite call can wait for a lock before raising.
+        self._db = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30)
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA synchronous=NORMAL")
+        self._db.execute("PRAGMA busy_timeout=30000")
+        self._db_lock = threading.Lock()
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS price_ticks (
+                timestamp   TEXT,
+                match_id    TEXT,
+                map_num     INTEGER,
+                token_id    TEXT,
+                side        TEXT,
+                price       REAL
+            )
+        """)
+        self._db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ticks_match_map_ts
+            ON price_ticks (match_id, map_num, timestamp)
+        """)
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS elo_snapshots (
+                timestamp   TEXT,
+                player      TEXT,
+                team        TEXT,
+                elo         REAL
+            )
+        """)
+        self._db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_elo_ts
+            ON elo_snapshots (timestamp)
+        """)
+        self._db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_elo_player
+            ON elo_snapshots (player)
+        """)
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                timestamp   TEXT,
+                match_id    TEXT,
+                map_num     INTEGER,
+                event_type  TEXT,
+                side        TEXT,
+                price       REAL,
+                reason      TEXT
+            )
+        """)
+        self._db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_events_match_map
+            ON events (match_id, map_num)
+        """)
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                timestamp       TEXT,
+                mode            TEXT,
+                match_id        TEXT,
+                map_num         INTEGER,
+                team_a          TEXT,
+                team_b          TEXT,
+                side            TEXT,
+                model_prob      REAL,
+                market_price    REAL,
+                edge            REAL,
+                kelly_pct       REAL,
+                position_size_usd REAL,
+                entry_price     REAL,
+                exit_price      REAL,
+                exit_reason     TEXT,
+                pnl             REAL
+            )
+        """)
+        self._db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_trades_match_map
+            ON trades (match_id, map_num)
+        """)
+        self._db.commit()
+        logger.info(f"SQLite DB ready: {DB_FILE}")
+
+    def _record_tick(self, match_id, map_num, token_id, side, price):
+        """Write a single price tick to SQLite."""
+        ts = datetime.now(timezone.utc).isoformat()
+        with self._db_lock:
+            self._db.execute(
+                "INSERT INTO price_ticks VALUES (?, ?, ?, ?, ?, ?)",
+                (ts, str(match_id), map_num, token_id, side, price),
+            )
+            self._db.commit()
+
+    def _record_trade(self, row):
+        """Write a trade row to SQLite (mirrors log_trade CSV write)."""
+        def _f(v):
+            if v is None or v == "":
+                return None
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                return None
+
+        with self._db_lock:
+            self._db.execute(
+                "INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    row.get("timestamp"),
+                    row.get("mode"),
+                    row.get("match_id"),
+                    int(row["map_num"]) if row.get("map_num") not in (None, "") else None,
+                    row.get("team_a"),
+                    row.get("team_b"),
+                    row.get("side"),
+                    _f(row.get("model_prob")),
+                    _f(row.get("market_price")),
+                    _f(row.get("edge")),
+                    _f(row.get("kelly_pct")),
+                    _f(row.get("position_size_usd")),
+                    _f(row.get("entry_price")),
+                    _f(row.get("exit_price")),
+                    row.get("exit_reason"),
+                    _f(row.get("pnl")),
+                ),
+            )
+            self._db.commit()
+
+    def _record_event(self, match_id, map_num, event_type, side, price, reason=None):
+        """Write an entry/exit event to SQLite."""
+        ts = datetime.now(timezone.utc).isoformat()
+        with self._db_lock:
+            self._db.execute(
+                "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (ts, str(match_id), map_num, event_type, side, price, reason),
+            )
+            self._db.commit()
+
+    def _record_elo_snapshot(self, all_player_elos):
+        """Write per-player Elo ratings to SQLite.
+
+        all_player_elos: {player: (team, elo), ...}
+        """
+        ts = datetime.now(timezone.utc).isoformat()
+        rows = [(ts, player, team, elo)
+                for player, (team, elo) in all_player_elos.items()]
+        if not rows:
+            return
+        with self._db_lock:
+            self._db.executemany(
+                "INSERT INTO elo_snapshots VALUES (?, ?, ?, ?)", rows
+            )
+            self._db.commit()
 
     # ──────────────────────────────────────────────────────────
     # STATE PERSISTENCE
@@ -219,7 +463,7 @@ class TradingAgent:
             logger.error(f"Failed to save state: {e}")
 
     def _load_state(self):
-        """Restore open positions and bankroll from disk."""
+        """Restore open positions and bankroll from disk, dropping any with zero balance."""
         if not os.path.exists(STATE_FILE):
             return
         try:
@@ -229,6 +473,24 @@ class TradingAgent:
                 logger.info(f"State file is for {state.get('mode')} mode, ignoring")
                 return
             positions = state.get("positions", {})
+            if not positions:
+                return
+
+            # In live mode, verify each position still has shares on-chain
+            if not self.paper:
+                verified = {}
+                for key, pos in positions.items():
+                    try:
+                        balance = self.trader.get_position(pos["token_id"])
+                        if balance > 0:
+                            verified[key] = pos
+                        else:
+                            logger.info(f"  Dropping {key}: no shares on-chain (resolved or sold)")
+                    except Exception as e:
+                        logger.warning(f"  Could not verify {key}, keeping: {e}")
+                        verified[key] = pos
+                positions = verified
+
             if positions:
                 self.positions = positions
                 if self.paper:
@@ -242,6 +504,9 @@ class TradingAgent:
                         f"  {key}: {pos['bet_team']} @ {pos['entry_price']:.2f} "
                         f"({pos['shares']:.1f} shares, ${pos['position_usd']:.2f})"
                     )
+            else:
+                logger.info("All saved positions resolved — starting fresh")
+                self._clear_state()
         except Exception as e:
             logger.error(f"Failed to load state: {e}")
 
@@ -260,6 +525,7 @@ class TradingAgent:
     def run(self):
         """Main agent loop — runs forever."""
         logger.info(f"Agent started ({self.mode} mode)")
+        notify(f"**Agent started** ({self.mode} mode) | Bankroll: ${self.bankroll:.2f}")
         self._start_price_monitor()
 
         while True:
@@ -271,57 +537,118 @@ class TradingAgent:
                 break
             except Exception as e:
                 logger.exception(f"Error in main loop: {e}")
+                notify(f"**Error** in main loop: {e}")
                 time.sleep(60)
 
     def _run_cycle(self):
-        """One cycle: find next match, wait, handle it."""
+        """One cycle: find actionable matches, dispatch threads for each."""
+        # Clean up finished match threads
+        with self._active_matches_lock:
+            done = [mid for mid, t in self._active_matches.items() if not t.is_alive()]
+            for mid in done:
+                self._active_matches.pop(mid)
+
         logger.info("Fetching upcoming VCT matches...")
         matches = get_upcoming_matches(vct_only=True)
 
+        self._match_done.clear()
+
         if not matches:
             logger.info("No upcoming VCT matches found. Sleeping 30 min...")
-            time.sleep(30 * 60)
+            self._match_done.wait(timeout=30 * 60)
             return
 
-        # Filter to matches with a start time, sort by soonest
-        timed = [m for m in matches if m["start_time"] is not None]
-        if not timed:
-            logger.info("No matches with start times. Sleeping 30 min...")
-            time.sleep(30 * 60)
-            return
-
-        timed.sort(key=lambda m: m["start_time"])
         now = datetime.now(timezone.utc)
 
-        # Find next match that hasn't started yet (or is live)
-        target = None
-        for m in timed:
+        # Collect all actionable matches (live or starting within 10 min)
+        actionable = []
+        for m in matches:
+            with self._active_matches_lock:
+                if m["match_id"] in self._active_matches:
+                    continue  # Already being handled
             if m["is_live"]:
-                target = m
-                logger.info(f"Found LIVE match: {m['team_a']} vs {m['team_b']}")
-                break
-            if m["start_time"] > now - timedelta(minutes=30):
-                target = m
-                break
+                actionable.append(m)
+            elif m["start_time"] is not None:
+                if m["start_time"] > now - timedelta(minutes=30):
+                    wake_time = m["start_time"] - timedelta(seconds=PRE_MATCH_LEAD)
+                    if wake_time <= now:
+                        actionable.append(m)
 
-        if not target:
-            logger.info("No actionable matches. Sleeping 30 min...")
-            time.sleep(30 * 60)
-            return
+        if not actionable:
+            # Find next upcoming match and sleep until T-10
+            timed = [m for m in matches if m["start_time"] is not None
+                     and m["start_time"] > now - timedelta(minutes=30)]
+            if not timed:
+                logger.info("No actionable matches. Sleeping 30 min...")
+                self._match_done.wait(timeout=30 * 60)
+                return
 
-        # Sleep until T-10 min before match
-        if not target["is_live"]:
-            wake_time = target["start_time"] - timedelta(seconds=PRE_MATCH_LEAD)
+            timed.sort(key=lambda m: m["start_time"])
+            nxt = timed[0]
+            wake_time = nxt["start_time"] - timedelta(seconds=PRE_MATCH_LEAD)
             wait_secs = (wake_time - now).total_seconds()
             if wait_secs > 0:
                 logger.info(
-                    f"Next match: {target['team_a']} vs {target['team_b']} "
-                    f"at {target['start_time'].strftime('%H:%M UTC')}"
+                    f"Next match: {nxt['team_a']} vs {nxt['team_b']} "
+                    f"at {nxt['start_time'].astimezone().strftime('%a %b %d %H:%M %Z')}"
                 )
-                logger.info(f"Sleeping {wait_secs/60:.1f} min until T-10...")
-                time.sleep(wait_secs)
+                logger.info(f"Sleeping {wait_secs/60:.1f} min until T-10 (or until current match ends)...")
+                self._match_done.wait(timeout=wait_secs)
+            return
 
-        self._handle_match(target)
+        # Dispatch a thread for each actionable match
+        for m in actionable:
+            mid = m["match_id"]
+            logger.info(f"Dispatching match thread: {m['team_a']} vs {m['team_b']} ({mid})")
+            t = threading.Thread(
+                target=self._handle_match_safe, args=(m,),
+                name=f"match-{mid}", daemon=True,
+            )
+            with self._active_matches_lock:
+                self._active_matches[mid] = t
+            t.start()
+
+        # Sleep until the next non-active match is approaching, so we pick up
+        # overlapping matches (e.g. one region running long into another's slot).
+        # Match threads already running handle their own maps independently.
+        # Uses _match_done event so a finishing match thread wakes us immediately
+        # (VCT matches start when the previous one ends, not at the scheduled time).
+        self._match_done.clear()
+        with self._active_matches_lock:
+            active_ids = set(self._active_matches.keys())
+        timed = [m for m in matches if m["start_time"] is not None
+                 and m["start_time"] > now - timedelta(minutes=30)
+                 and m["match_id"] not in active_ids
+                 and m not in actionable]
+        if timed:
+            timed.sort(key=lambda m: m["start_time"])
+            nxt = timed[0]
+            wake_time = nxt["start_time"] - timedelta(seconds=PRE_MATCH_LEAD)
+            wait_secs = max((wake_time - now).total_seconds(), 60)
+            logger.info(
+                f"Next match: {nxt['team_a']} vs {nxt['team_b']} "
+                f"at {nxt['start_time'].astimezone().strftime('%a %b %d %H:%M %Z')}"
+            )
+            logger.info(f"Sleeping {wait_secs/60:.1f} min until T-10 (or until current match ends)...")
+            self._match_done.wait(timeout=wait_secs)
+        else:
+            # No upcoming matches beyond what's active — check back in 30 min
+            self._match_done.wait(timeout=30 * 60)
+
+    def _handle_match_safe(self, match):
+        """Wrapper around _handle_match with error handling for threads."""
+        try:
+            self._handle_match(match)
+        except Exception as e:
+            logger.exception(f"Error handling match {match['team_a']} vs {match['team_b']}: {e}")
+            notify(f"**Error** in match {match['team_a']} vs {match['team_b']}: {e}")
+        finally:
+            with self._active_matches_lock:
+                self._active_matches.pop(match["match_id"], None)
+            # VLR doesn't update the next match's ETA the instant this one ends.
+            # Give it a buffer so the repoll sees the refreshed relative countdown.
+            time.sleep(POST_MATCH_REPOLL_DELAY)
+            self._match_done.set()
 
     # ──────────────────────────────────────────────────────────
     # MATCH HANDLER
@@ -334,29 +661,66 @@ class TradingAgent:
         match_url = match["match_url"]
         match_id = match["match_id"]
 
-        logger.info(f"{'='*50}")
-        logger.info(f"MATCH: {team_a} vs {team_b}")
-        logger.info(f"URL: {match_url}")
-        logger.info(f"{'='*50}")
+        logger.info(
+            f"\n{'='*50}\n"
+            f"MATCH: {team_a} vs {team_b}\n"
+            f"URL: {match_url}\n"
+            f"{'='*50}"
+        )
+        notify(f"**Match starting** | {team_a} vs {team_b}")
 
-        # ── Map 1: wait for veto (map name appears), then 5 min entry window ──
+        # Kick off the Elo snapshot pre-compute in the background. By the time
+        # veto is detected (usually minutes away), the cache will be warm and
+        # the Map 1 edge check runs in ~5s instead of ~100s.
+        self._trigger_elo_precompute("match dispatch")
+
+        # ── Map 1: poll for veto, then retry entry until filled or window expires.
+        # No pre-veto wait — Map 1's entry window is gated by the veto itself, not
+        # a cooldown from a prior map. Start polling VLR immediately on dispatch.
         if not match["is_live"]:
-            self._wait_for_entry_window(match)
             map1_name = self._wait_for_veto(match_url)
-            if map1_name:
-                logger.info(f"Map 1 veto detected: {map1_name} — entry window OPEN (5 min)")
-                self._enter_map(team_a, team_b, match_id, map_num=1, map_name=map1_name)
-                time.sleep(ENTRY_WINDOW_SECS)
-                self._close_entry_window(map_num=1)
-            else:
-                logger.info("Match went live before veto detected — entering without map")
-                self._enter_map(team_a, team_b, match_id, map_num=1, map_name=None)
-                self._close_entry_window(map_num=1)
+            logger.info(f"Map 1 veto detected: {map1_name} — entry window OPEN (5 min)")
+            self._retry_entry_until_filled(team_a, team_b, match_id, map_num=1, map_name=map1_name)
         else:
             logger.info("Match already live — skipping Map 1 entry")
 
         # ── Poll through the series ──
+        # Seed prev_finals with maps already final (skip cooldown for those)
         prev_finals = set()
+        initial_status = poll_match_status(match_url)
+        if initial_status:
+            for map_num, map_data in initial_status["maps"].items():
+                if map_data["final"]:
+                    score = f"{map_data['score_a']}-{map_data['score_b']}"
+                    logger.info(f"Map {map_num} already FINAL ({score}) — skipping cooldown")
+                    prev_finals.add(map_num)
+
+            # If maps are already done but series isn't over, enter the next map now
+            # Only enter Map 3 if series is tied 1-1
+            if prev_finals and not initial_status["is_final"]:
+                wins_a = sum(
+                    1 for m in initial_status["maps"].values()
+                    if m["final"] and m["score_a"] > m["score_b"]
+                )
+                wins_b = sum(
+                    1 for m in initial_status["maps"].values()
+                    if m["final"] and m["score_b"] > m["score_a"]
+                )
+                if wins_a >= 2 or wins_b >= 2:
+                    logger.info("Series already decided — no more maps")
+                else:
+                    next_map = max(prev_finals) + 1
+                    if next_map <= 3:
+                        # Skip if the next map is already live (rounds being played)
+                        next_map_data = initial_status["maps"].get(next_map)
+                        if next_map_data and (next_map_data["score_a"] + next_map_data["score_b"]) > 0:
+                            logger.info(f"Map {next_map} already live — skipping entry")
+                        else:
+                            next_map_name = next_map_data.get("map_name") if next_map_data else None
+                            map_label = f" ({next_map_name})" if next_map_name else ""
+                            logger.info(f"Map {next_map}{map_label} entry window OPEN (5 min)")
+                            self._retry_entry_until_filled(team_a, team_b, match_id, map_num=next_map, map_name=next_map_name)
+
         series_over = False
 
         while not series_over:
@@ -405,25 +769,65 @@ class TradingAgent:
             if not series_over:
                 time.sleep(POLL_INTERVAL)
 
+        # ── Record winners for any maps that finalized in the last poll ──
+        if status:
+            for map_num, map_data in status["maps"].items():
+                if map_data["final"] and map_data["score_a"] != map_data["score_b"]:
+                    map_winner = team_a if map_data["score_a"] > map_data["score_b"] else team_b
+                    self._record_map_winner(match_id, map_num, map_winner)
+
+        # ── Resolve any positions still open (e.g. held to market resolution) ──
+        self._resolve_remaining_positions(match_id)
+
         # ── Series complete: scrape final map ──
         logger.info("Scraping final match data...")
         self._scrape_match(match_id)
         logger.info(f"Match complete: {team_a} vs {team_b}")
 
+        # Find next match for Discord notification
+        next_match_str = "none found"
+        try:
+            upcoming = get_upcoming_matches(vct_only=True)
+            upcoming = [m for m in upcoming if m["match_id"] != match_id]
+            if upcoming:
+                timed = [m for m in upcoming if m["start_time"] is not None]
+                live = [m for m in upcoming if m["is_live"]]
+                if live:
+                    nxt = live[0]
+                    next_match_str = f"{nxt['team_a']} vs {nxt['team_b']} (LIVE)"
+                elif timed:
+                    timed.sort(key=lambda m: m["start_time"])
+                    nxt = timed[0]
+                    next_match_str = f"{nxt['team_a']} vs {nxt['team_b']} @ <t:{int(nxt['start_time'].timestamp())}:t>"
+        except Exception:
+            pass
+
+        notify(f"**Match complete** | {team_a} vs {team_b}\n**Next match:** {next_match_str}")
+
     # ──────────────────────────────────────────────────────────
     # ENTRY WINDOW
     # ──────────────────────────────────────────────────────────
 
-    def _wait_for_entry_window(self, match):
-        """Sleep until T-5 min before match start."""
-        if match["start_time"] is None:
-            return
-        entry_time = match["start_time"] - timedelta(seconds=ENTRY_LEAD)
-        now = datetime.now(timezone.utc)
-        wait = (entry_time - now).total_seconds()
-        if wait > 0:
-            logger.info(f"Waiting {wait/60:.1f} min for entry window...")
-            time.sleep(wait)
+    def _retry_entry_until_filled(self, team_a, team_b, match_id, map_num, map_name=None):
+        """Retry _enter_map with fresh prices until filled or entry window expires."""
+        deadline = time.time() + ENTRY_WINDOW_SECS
+        cached_prediction = None
+        while time.time() < deadline:
+            result, prediction = self._enter_map(team_a, team_b, match_id, map_num, map_name=map_name, cached_prediction=cached_prediction)
+            if result == "no_edge":
+                logger.info(f"  No edge detected — skipping retries, waiting for next map")
+                break
+            if result:
+                break
+            # Cache prediction from first run so retries only refresh prices
+            if cached_prediction is None and prediction is not None:
+                cached_prediction = prediction
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            logger.info(f"  Retrying entry in {FILL_POLL_TIMEOUT}s ({remaining:.0f}s left in window)...")
+            time.sleep(min(FILL_POLL_TIMEOUT, remaining))
+        self._close_entry_window(map_num=map_num)
 
     def _wait_for_live(self, match_url):
         """Poll VLR until match goes live (Map 1 started)."""
@@ -436,18 +840,13 @@ class TradingAgent:
             time.sleep(POLL_INTERVAL)
 
     def _wait_for_veto(self, match_url):
-        """Poll VLR until Map 1's map name appears (veto complete) or match goes live."""
+        """Poll VLR until Map 1's map name appears (veto complete)."""
         logger.info("Waiting for map veto (Map 1 name to appear)...")
         while True:
             status = poll_match_status(match_url)
             if status is None:
                 time.sleep(POLL_INTERVAL)
                 continue
-            # If match went live before we saw a map name, return None
-            if status["is_live"] or status["is_final"]:
-                map1 = status["maps"].get(1, {})
-                return map1.get("map_name")
-            # Check if map name appeared (veto done, match still upcoming)
             map1 = status["maps"].get(1, {})
             map_name = map1.get("map_name")
             if map_name:
@@ -455,99 +854,178 @@ class TradingAgent:
             time.sleep(POLL_INTERVAL)
 
     def _close_entry_window(self, map_num):
-        """Cancel any unfilled orders for this map's entry."""
-        logger.info(f"Map {map_num} entry window CLOSED — cancelling unfilled orders")
-        if not self.paper:
+        """Cancel the unfilled entry order for this map (if any)."""
+        logger.info(f"Map {map_num} entry window CLOSED")
+        order_id = self._pending_entry_orders.pop(map_num, None)
+        if order_id and not self.paper:
             try:
-                self.trader.cancel_all()
+                self.trader.cancel(order_id)
+                logger.info(f"  Cancelled unfilled entry order {order_id}")
             except Exception as e:
-                logger.error(f"Error cancelling orders: {e}")
+                logger.error(f"Error cancelling order {order_id}: {e}")
 
     def _between_maps(self, team_a, team_b, match_id, match_url, finished_map, next_map):
         """Cooldown, rescrape, then open entry for next map."""
         logger.info(f"Map {finished_map} done — {COOLDOWN_SECS//60} min cooldown")
 
-        # Scrape the finished map
+        # Scrape the finished map (synchronous; Excel mtime bumps on completion)
         self._scrape_game(match_id, finished_map)
+
+        # Scraper just rewrote Excel — trigger an Elo precompute so the next
+        # map's edge check uses post-scrape ratings without paying the 34s
+        # recompute inline. Runs during the cooldown window in parallel.
+        self._trigger_elo_precompute(f"post-scrape Map {finished_map}")
 
         # Cooldown
         time.sleep(COOLDOWN_SECS)
 
-        # Get map name for next map from poller
+        # Poll for next map name (up to 60s, then enter without it)
         next_map_name = None
-        status = poll_match_status(match_url)
-        if status and next_map in status["maps"]:
-            next_map_name = status["maps"][next_map].get("map_name")
+        logger.info(f"Polling for Map {next_map} name...")
+        poll_deadline = time.time() + 60
+        while time.time() < poll_deadline:
+            status = poll_match_status(match_url)
+            if status and next_map in status["maps"]:
+                next_map_name = status["maps"][next_map].get("map_name")
+                if next_map_name:
+                    break
+            time.sleep(POLL_INTERVAL)
 
-        map_label = f" ({next_map_name})" if next_map_name else ""
+        map_label = f" ({next_map_name})" if next_map_name else " (unknown map)"
         logger.info(f"Map {next_map}{map_label} entry window OPEN (5 min)")
-        self._enter_map(team_a, team_b, match_id, map_num=next_map, map_name=next_map_name)
-
-        logger.info(f"Map {next_map} entry window — waiting 5 min...")
-        time.sleep(ENTRY_WINDOW_SECS)
-        self._close_entry_window(map_num=next_map)
+        self._retry_entry_until_filled(team_a, team_b, match_id, map_num=next_map, map_name=next_map_name)
 
     # ──────────────────────────────────────────────────────────
     # EDGE DETECTION & ENTRY
     # ──────────────────────────────────────────────────────────
 
-    def _enter_map(self, team_a, team_b, match_id, map_num, map_name=None):
-        """Check edge and enter a position if edge > threshold."""
+    def _enter_map(self, team_a, team_b, match_id, map_num, map_name=None, cached_prediction=None):
+        """Check edge and enter a position if edge > threshold. Returns (result, prediction) tuple."""
         map_label = f" ({map_name})" if map_name else ""
         logger.info(f"Checking edge for Map {map_num}{map_label}: {team_a} vs {team_b}")
 
-        # Run Elo model
-        try:
-            prob_a, elo_features, player_info, maps_played = predict_elo_only(team_a, team_b, map_name=map_name)
-        except Exception as e:
-            logger.error(f"Model prediction failed: {e}")
-            return
-
-        # Check that both teams have meaningful data (not just default Elo)
-        players_a = player_info.get(list(player_info.keys())[0], []) if player_info else []
-        players_b = player_info.get(list(player_info.keys())[1], []) if len(player_info) > 1 else []
-        if not players_a or not players_b:
-            logger.warning(f"  Missing player data for one or both teams -- skipping")
-            return
-
-        # Skip teams with too little data for reliable predictions
-        MIN_MAPS = 8
-        for team, count in maps_played.items():
-            if count < MIN_MAPS:
-                logger.warning(f"  {team} has only {count} maps in dataset (min {MIN_MAPS}) -- skipping")
-                return
-
-        # Cap confidence at MAX_CONFIDENCE (either side)
-        raw_prob_a = prob_a
-        prob_a = min(prob_a, MAX_CONFIDENCE)
-        prob_a = max(prob_a, 1 - MAX_CONFIDENCE)
-        prob_b = 1 - prob_a
-
-        if raw_prob_a != prob_a:
-            logger.info(f"  Model (raw): {team_a} {raw_prob_a:.1%}  {team_b} {1-raw_prob_a:.1%}")
-            logger.info(f"  Model (capped): {team_a} {prob_a:.1%}  {team_b} {prob_b:.1%}")
+        if cached_prediction:
+            prob_a = cached_prediction["prob_a"]
+            prob_b = cached_prediction["prob_b"]
+            prediction = cached_prediction
+            logger.info(f"  Model (cached): {team_a} {prob_a:.1%}  {team_b} {prob_b:.1%}")
         else:
-            logger.info(f"  Model: {team_a} {prob_a:.1%}  {team_b} {prob_b:.1%}")
+            # Run Elo model
+            try:
+                prob_a, elo_features, player_info, maps_played, all_player_elos = predict_elo_only(team_a, team_b, map_name=map_name)
+            except Exception as e:
+                logger.error(f"Model prediction failed: {e}")
+                return False, None
+
+            # Log full Elo snapshot to SQLite (all players, all teams)
+            try:
+                self._record_elo_snapshot(all_player_elos)
+            except Exception as e:
+                logger.debug(f"  Elo snapshot write error: {e}")
+
+            # Check that both teams have meaningful data (not just default Elo)
+            players_a = player_info.get(list(player_info.keys())[0], []) if player_info else []
+            players_b = player_info.get(list(player_info.keys())[1], []) if len(player_info) > 1 else []
+            if not players_a or not players_b:
+                logger.warning(f"  Missing player data for one or both teams -- skipping")
+                return False, None
+
+            # Skip teams with too little data for reliable predictions
+            MIN_MAPS = 8
+            for team, count in maps_played.items():
+                if count < MIN_MAPS:
+                    logger.warning(f"  {team} has only {count} maps in dataset (min {MIN_MAPS}) -- skipping")
+                    return False, None
+
+            # Cap confidence at MAX_CONFIDENCE (either side)
+            raw_prob_a = prob_a
+            prob_a = min(prob_a, MAX_CONFIDENCE)
+            prob_a = max(prob_a, 1 - MAX_CONFIDENCE)
+            prob_b = 1 - prob_a
+            prediction = {"prob_a": prob_a, "prob_b": prob_b}
+
+            if raw_prob_a != prob_a:
+                logger.info(f"  Model (raw): {team_a} {raw_prob_a:.1%}  {team_b} {1-raw_prob_a:.1%}")
+                logger.info(f"  Model (capped): {team_a} {prob_a:.1%}  {team_b} {prob_b:.1%}")
+            else:
+                logger.info(f"  Model: {team_a} {prob_a:.1%}  {team_b} {prob_b:.1%}")
 
         # Get Polymarket prices
         try:
             prices = get_match_prices(team_a, team_b)
         except Exception as e:
             logger.error(f"Polymarket price fetch failed: {e}")
-            return
+            return False, prediction
 
-        if not prices or map_num not in prices["maps"]:
+        if not prices:
+            logger.warning(f"  No Polymarket markets found")
+            return False, prediction
+
+        # For Map 3, prefer moneyline (higher volume, same bet)
+        map_market = None
+        market_source = f"Map {map_num}"
+        is_moneyline = False
+        if map_num == 3 and prices.get("moneyline"):
+            map_market = prices["moneyline"]
+            market_source = "Moneyline"
+            is_moneyline = True
+            logger.info(f"  Using moneyline market for Map 3 (higher volume)")
+        elif map_num in prices["maps"]:
+            map_market = prices["maps"][map_num]
+
+        if not map_market:
             logger.warning(f"  No Polymarket market found for Map {map_num}")
-            return
+            return False, prediction
 
-        map_market = prices["maps"][map_num]
-        market_price_a = map_market["price_a"]
-        market_price_b = map_market["price_b"]
         condition_id = map_market["condition_id"]
         swapped = prices["swapped"]
 
+        market_price_a = map_market["price_a"]
+        market_price_b = map_market["price_b"]
+        token_a = None
+        token_b = None
+        try:
+            market_info = self.trader.get_market_info(condition_id)
+            token_a = market_info["token_b"] if swapped else market_info["token_a"]
+            token_b = market_info["token_a"] if swapped else market_info["token_b"]
+        except Exception as e:
+            logger.warning(f"  CLOB market info fetch failed for watchers: {e}")
+
+        if not self.paper and token_a and token_b:
+            try:
+                ask_a = self.trader.get_market_price(token_a)["best_ask"]
+                ask_b = self.trader.get_market_price(token_b)["best_ask"]
+                if ask_a is not None and ask_b is not None:
+                    market_price_a = ask_a
+                    market_price_b = ask_b
+            except Exception as e:
+                logger.debug(f"  Ask price fetch failed, using Gamma: {e}")
+
+        # Register price watchers for both sides so ticks are recorded
+        # regardless of whether a bet is placed (for trailing floor analysis)
+        if token_a and token_b:
+            wkey_a = f"{match_id}_{map_num}_{team_a}"
+            wkey_b = f"{match_id}_{map_num}_{team_b}"
+            registered = []
+            if wkey_a not in self._price_watchers:
+                self._price_watchers[wkey_a] = {
+                    "match_id": match_id, "map_num": map_num,
+                    "token_id": token_a, "side": team_a,
+                }
+                registered.append(team_a)
+            if wkey_b not in self._price_watchers:
+                self._price_watchers[wkey_b] = {
+                    "match_id": match_id, "map_num": map_num,
+                    "token_id": token_b, "side": team_b,
+                }
+                registered.append(team_b)
+            if registered:
+                logger.info(f"  Price watchers registered for Map {map_num}: {', '.join(registered)}")
+        else:
+            logger.warning(f"  No price watchers registered for Map {map_num} — tokens unavailable")
+
         logger.info(
-            f"  Market: {team_a} {market_price_a:.1%}  {team_b} {market_price_b:.1%}"
+            f"  Market ({market_source}): {team_a} {market_price_a:.1%}  {team_b} {market_price_b:.1%}"
         )
 
         # Compute edge for both sides
@@ -558,19 +1036,22 @@ class TradingAgent:
 
         # Pick the side with better edge (if any exceeds threshold)
         if edge_a >= EDGE_THRESHOLD and edge_a >= edge_b:
-            self._place_entry(
+            return self._place_entry(
                 team_a, team_b, match_id, map_num,
                 side="a", prob=prob_a, market_price=market_price_a,
                 edge=edge_a, condition_id=condition_id, swapped=swapped,
-            )
+                is_moneyline=is_moneyline,
+            ), prediction
         elif edge_b >= EDGE_THRESHOLD:
-            self._place_entry(
+            return self._place_entry(
                 team_a, team_b, match_id, map_num,
                 side="b", prob=prob_b, market_price=market_price_b,
                 edge=edge_b, condition_id=condition_id, swapped=swapped,
-            )
+                is_moneyline=is_moneyline,
+            ), prediction
         else:
             logger.info(f"  No edge above {EDGE_THRESHOLD:.0%} threshold — skipping")
+            notify(f"**No edge** | {team_a} vs {team_b} Map {map_num} | Edge A: {edge_a:+.1%} Edge B: {edge_b:+.1%}")
             log_trade({
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "mode": self.mode,
@@ -579,107 +1060,223 @@ class TradingAgent:
                 "team_a": team_a,
                 "team_b": team_b,
                 "side": "none",
-                "model_prob": f"{max(prob_a, prob_b):.4f}",
-                "market_price": f"{min(market_price_a, market_price_b):.4f}",
-                "edge": f"{max(edge_a, edge_b):.4f}",
+                "model_prob": f"{prob_a:.4f}",
+                "market_price": f"{market_price_a:.4f}",
+                "edge": f"{edge_a:.4f}",
                 "kelly_pct": "0",
                 "position_size_usd": "0",
                 "entry_price": "",
                 "exit_price": "",
                 "exit_reason": "no_edge",
                 "pnl": "0",
-                "map_winner": "",
-                "model_correct": "",
             })
+            return "no_edge", prediction
 
     def _place_entry(self, team_a, team_b, match_id, map_num,
-                     side, prob, market_price, edge, condition_id, swapped):
-        """Place an entry order (or log it in paper mode)."""
+                     side, prob, market_price, edge, condition_id, swapped,
+                     is_moneyline=False):
+        """Place an entry order (or log it in paper mode). Returns True if filled or permanently skipped."""
         bet_team = team_a if side == "a" else team_b
         kelly_pct = quarter_kelly(prob, market_price)
 
-        # Get current bankroll
-        if self.paper:
-            bankroll = self.bankroll
-        else:
-            bankroll = self.trader.get_balance()
-
-        position_usd = bankroll * kelly_pct
-        if position_usd < 1:
-            logger.info(f"  Position too small (${position_usd:.2f}) — skipping (min $1)")
-            log_trade({
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "mode": self.mode,
-                "match_id": match_id,
-                "map_num": map_num,
-                "team_a": team_a,
-                "team_b": team_b,
-                "side": bet_team,
-                "model_prob": f"{prob:.4f}",
-                "market_price": f"{market_price:.4f}",
-                "edge": f"{edge:.4f}",
-                "kelly_pct": f"{kelly_pct:.4f}",
-                "position_size_usd": f"{position_usd:.2f}",
-                "entry_price": "",
-                "exit_price": "",
-                "exit_reason": "below_min",
-                "pnl": "0",
-                "map_winner": "",
-                "model_correct": "",
-            })
-            return
-
-        # Calculate shares: at price p, $X buys X/p shares
-        shares = position_usd / market_price
-
-        logger.info(
-            f"  BUY {bet_team} | Edge: {edge:.1%} | "
-            f"Kelly: {kelly_pct:.1%} | Size: ${position_usd:.2f} | "
-            f"Shares: {shares:.1f} @ {market_price:.2f}"
-        )
-
-        # Resolve token_id
-        token_id = None
-        tick_size = "0.01"
-        neg_risk = False
-
+        # Balance lock prevents concurrent match threads from double-spending
         try:
-            market_info = self.trader.get_market_info(condition_id)
-            tick_size = market_info["tick_size"]
-            neg_risk = market_info["neg_risk"]
+            self._balance_lock.acquire()
 
-            # Map side to token:
-            # If not swapped: side "a" → token_a (outcome 0), side "b" → token_b
-            # If swapped: side "a" → token_b (outcome 1), side "b" → token_a
-            if side == "a":
-                token_id = market_info["token_b"] if swapped else market_info["token_a"]
+            # Get current bankroll
+            if self.paper:
+                bankroll = self.bankroll
             else:
-                token_id = market_info["token_a"] if swapped else market_info["token_b"]
-        except Exception as e:
-            logger.error(f"  Failed to resolve token_id: {e}")
-            if not self.paper:
-                return
+                bankroll = self.trader.get_balance()
 
-        entry_price = market_price
-        order_id = None
+            position_usd = bankroll * kelly_pct
 
-        if self.paper:
-            logger.info(f"  [PAPER] Order logged — not placed")
-            self.bankroll -= position_usd
-        else:
+            # Ensure we buy at least MIN_BUY_SHARES so post-fee balance stays >= MIN_CLOB_SHARES (sellable)
+            min_position_usd = MIN_BUY_SHARES * market_price
+            if not self.paper and position_usd < min_position_usd:
+                if bankroll >= min_position_usd:
+                    logger.info(f"  Position ${position_usd:.2f} below min {MIN_BUY_SHARES} shares (${min_position_usd:.2f}) — bumping to minimum")
+                    position_usd = min_position_usd
+                else:
+                    logger.info(f"  Position too small (${position_usd:.2f}) and bankroll can't cover min {MIN_BUY_SHARES} shares (${min_position_usd:.2f}) — skipping")
+                    log_trade({
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "mode": self.mode,
+                        "match_id": match_id,
+                        "map_num": map_num,
+                        "team_a": team_a,
+                        "team_b": team_b,
+                        "side": bet_team,
+                        "model_prob": f"{prob:.4f}",
+                        "market_price": f"{market_price:.4f}",
+                        "edge": f"{edge:.4f}",
+                        "kelly_pct": f"{kelly_pct:.4f}",
+                        "position_size_usd": f"{position_usd:.2f}",
+                        "entry_price": "",
+                        "exit_price": "",
+                        "exit_reason": "below_min",
+                        "pnl": "0",
+                    })
+                    return True
+
+            if self.paper and position_usd < 1:
+                logger.info(f"  Position too small (${position_usd:.2f}) — skipping (min $1)")
+                log_trade({
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "mode": self.mode,
+                    "match_id": match_id,
+                    "map_num": map_num,
+                    "team_a": team_a,
+                    "team_b": team_b,
+                    "side": bet_team,
+                    "model_prob": f"{prob:.4f}",
+                    "market_price": f"{market_price:.4f}",
+                    "edge": f"{edge:.4f}",
+                    "kelly_pct": f"{kelly_pct:.4f}",
+                    "position_size_usd": f"{position_usd:.2f}",
+                    "entry_price": "",
+                    "exit_price": "",
+                    "exit_reason": "below_min",
+                    "pnl": "0",
+                })
+                return True
+
+            # Calculate shares: at price p, $X buys X/p shares
+            shares = position_usd / market_price
+
+            logger.info(
+                f"  BUY {bet_team} | Edge: {edge:.1%} | "
+                f"Kelly: {kelly_pct:.1%} | Size: ${position_usd:.2f} | "
+                f"Shares: {shares:.1f} @ {market_price:.2f}"
+            )
+            # Resolve token_id
+            token_id = None
+            tick_size = "0.01"
+            neg_risk = False
+
             try:
-                resp = self.trader.buy(
-                    token_id=token_id,
-                    price=round(market_price, 2),
-                    size=round(shares, 2),
-                    tick_size=tick_size,
-                    neg_risk=neg_risk,
-                )
-                order_id = resp.get("orderID") or resp.get("id")
-                logger.info(f"  Order placed: {order_id}")
+                market_info = self.trader.get_market_info(condition_id)
+                tick_size = market_info["tick_size"]
+                neg_risk = market_info["neg_risk"]
+
+                # Map side to token:
+                # If not swapped: side "a" → token_a (outcome 0), side "b" → token_b
+                # If swapped: side "a" → token_b (outcome 1), side "b" → token_a
+                if side == "a":
+                    token_id = market_info["token_b"] if swapped else market_info["token_a"]
+                else:
+                    token_id = market_info["token_a"] if swapped else market_info["token_b"]
             except Exception as e:
-                logger.error(f"  Order failed: {e}")
-                return
+                logger.error(f"  Failed to resolve token_id: {e}")
+                if not self.paper:
+                    return True
+
+            entry_price = market_price
+            order_id = None
+
+            if self.paper:
+                logger.info(f"  [PAPER] Order logged — not placed")
+                self.bankroll -= position_usd
+            else:
+                # Snapshot USDC balance before buy to compute actual cost
+                try:
+                    balance_before = self.trader.get_balance()
+                except Exception:
+                    balance_before = None
+
+                try:
+                    buy_price = round(market_price, 2)
+                    resp = self.trader.buy(
+                        token_id=token_id,
+                        price=buy_price,
+                        size=round(shares, 2),
+                        tick_size=tick_size,
+                        neg_risk=neg_risk,
+                    )
+                    order_id = resp.get("orderID") or resp.get("id")
+                    self._pending_entry_orders[map_num] = order_id
+                    logger.info(f"  Order placed: {order_id} — polling for fill...")
+                except Exception as e:
+                    logger.error(f"  Order failed: {e}")
+                    notify(f"**BUY FAILED** {bet_team} Map {map_num} | {e}")
+                    return True
+
+                # Poll for fill
+                fill = self._poll_fill(order_id, token_id)
+                self._pending_entry_orders.pop(map_num, None)
+                if not fill["filled"]:
+                    logger.warning(f"  Order not filled within {FILL_POLL_TIMEOUT}s — cancelling")
+                    try:
+                        self.trader.cancel(order_id)
+                    except Exception:
+                        pass
+                    notify(f"**BUY UNFILLED** {bet_team} Map {map_num} — retrying")
+                    return False
+
+                # Query actual on-chain shares (fees reduce tokens received)
+                try:
+                    actual_shares = self.trader.get_position(token_id)
+                    if actual_shares > 0:
+                        shares = actual_shares
+                except Exception as e:
+                    logger.warning(f"  Could not verify on-chain balance: {e}")
+                    shares = fill["shares"]
+
+                # Compute actual entry price from USDC spent / shares received
+                try:
+                    balance_after = self.trader.get_balance()
+                    if balance_before is not None and shares > 0:
+                        usdc_spent = balance_before - balance_after
+                        if usdc_spent > 0:
+                            entry_price = usdc_spent / shares
+                            position_usd = usdc_spent
+                            logger.info(
+                                f"  Order FILLED: {shares:.2f} shares | "
+                                f"Spent: ${usdc_spent:.2f} | Avg price: {entry_price:.4f}"
+                            )
+                        else:
+                            # Fallback to trade history
+                            if fill["avg_price"] > 0:
+                                entry_price = fill["avg_price"]
+                            position_usd = shares * entry_price
+                            logger.info(f"  Order FILLED: {shares:.2f} shares @ {entry_price:.2f} (${position_usd:.2f})")
+                    else:
+                        if fill["avg_price"] > 0:
+                            entry_price = fill["avg_price"]
+                        position_usd = shares * entry_price
+                        logger.info(f"  Order FILLED: {shares:.2f} shares @ {entry_price:.2f} (${position_usd:.2f})")
+                except Exception as e:
+                    logger.warning(f"  Could not verify entry price from balance: {e}")
+                    if fill["avg_price"] > 0:
+                        entry_price = fill["avg_price"]
+                    position_usd = shares * entry_price
+                    logger.info(f"  Order FILLED: {shares:.2f} shares @ {entry_price:.2f} (${position_usd:.2f})")
+
+                # Approve token for selling
+                try:
+                    self.trader.approve_token(token_id)
+                    logger.debug(f"  Token approved for trading")
+                except Exception as e:
+                    logger.error(f"  Token approval failed: {e}")
+        finally:
+            self._balance_lock.release()
+
+        # Snapshot best_bid at entry to use as the baseline for floor/stop math.
+        # Entry fill is at best_ask; the monitor compares against best_bid, so
+        # the ladder needs a bid-space baseline to avoid a 1-2 tick skew.
+        entry_bid = entry_price
+        if not self.paper and self.trader:
+            try:
+                bid = self.trader.get_market_price(token_id)["best_bid"]
+                if bid is not None and bid > 0:
+                    entry_bid = bid
+            except Exception as e:
+                logger.debug(f"  entry_bid snapshot failed, using entry_price: {e}")
+
+        notify(
+            f"**BUY {bet_team}** Map {map_num} | Edge: {edge:.1%} | "
+            f"Filled: {shares:.1f} shares @ {entry_price:.2f} (${position_usd:.2f})"
+        )
 
         # Track position
         pos_key = f"{match_id}_map{map_num}_{side}"
@@ -694,6 +1291,7 @@ class TradingAgent:
                 "bet_team": bet_team,
                 "side": side,
                 "entry_price": entry_price,
+                "entry_bid": entry_bid,
                 "high_price": entry_price,
                 "shares": shares,
                 "position_usd": position_usd,
@@ -701,6 +1299,7 @@ class TradingAgent:
                 "tick_size": tick_size,
                 "neg_risk": neg_risk,
                 "swapped": swapped,
+                "is_moneyline": is_moneyline,
             }
 
         log_trade({
@@ -720,11 +1319,15 @@ class TradingAgent:
             "exit_price": "",
             "exit_reason": "open",
             "pnl": "",
-            "map_winner": "",
-            "model_correct": "",
         })
 
+        try:
+            self._record_event(match_id, map_num, "entry", bet_team, entry_price, "edge")
+        except Exception as e:
+            logger.debug(f"  Event write error: {e}")
+
         self._save_state()
+        return True
 
     # ──────────────────────────────────────────────────────────
     # PRICE MONITOR (trailing floor + stop loss)
@@ -741,6 +1344,64 @@ class TradingAgent:
 
     def _stop_price_monitor(self):
         self._monitor_running = False
+
+    def _poll_fill(self, order_id, token_id, timeout=FILL_POLL_TIMEOUT):
+        """
+        Poll until an order fills (or times out).
+
+        Returns
+        -------
+        dict: {"filled": bool, "shares": float, "avg_price": float}
+            avg_price is the volume-weighted average from actual trade history.
+        """
+        if order_id is None:
+            return {"filled": False, "shares": 0, "avg_price": 0}
+
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                order = self.trader.get_order(order_id)
+                status = order.get("status", "").lower()
+                size_matched = float(order.get("size_matched", 0))
+                original_size = float(order.get("original_size", order.get("size", 0)))
+
+                if status == "matched" or (original_size > 0 and size_matched >= original_size):
+                    avg_price = self._get_avg_fill_price(order_id, size_matched)
+                    return {"filled": True, "shares": size_matched, "avg_price": avg_price}
+
+                if status in ("cancelled", "expired", "rejected", "failed", "error"):
+                    logger.warning(f"  Order {order_id} status: {status}")
+                    return {"filled": False, "shares": size_matched, "avg_price": 0}
+
+                if status not in ("live", "open", "matched", ""):
+                    logger.warning(f"  Order {order_id} unexpected status: {status}")
+                    return {"filled": False, "shares": size_matched, "avg_price": 0}
+
+            except Exception as e:
+                logger.debug(f"  Fill poll error: {e}")
+
+            time.sleep(FILL_POLL_INTERVAL)
+
+        return {"filled": False, "shares": 0, "avg_price": 0}
+
+    def _get_avg_fill_price(self, order_id, fallback_shares):
+        """Compute volume-weighted average fill price from trade history."""
+        try:
+            trades = self.trader.get_trades_for_order(order_id)
+            if not trades:
+                return 0
+            total_size = 0
+            total_cost = 0
+            for t in trades:
+                size = float(t.get("size", 0))
+                price = float(t.get("price", 0))
+                total_size += size
+                total_cost += size * price
+            if total_size > 0:
+                return total_cost / total_size
+        except Exception as e:
+            logger.debug(f"  Could not fetch trade history for order {order_id}: {e}")
+        return 0
 
     def _price_monitor_loop(self):
         """Check all open positions every PRICE_MONITOR_INTERVAL seconds."""
@@ -762,55 +1423,123 @@ class TradingAgent:
                 if pos is None:
                     continue
 
-            token_id = pos["token_id"]
-
-            # Get current price
-            try:
-                if self.paper and token_id is None:
-                    # Paper mode without real token — use Polymarket Gamma API
-                    prices = get_match_prices(pos["team_a"], pos["team_b"])
-                    if prices and pos["map_num"] in prices["maps"]:
-                        map_data = prices["maps"][pos["map_num"]]
-                        current = map_data["price_a"] if pos["side"] == "a" else map_data["price_b"]
-                    else:
-                        continue
-                else:
-                    price_data = self.trader.get_market_price(token_id)
-                    current = price_data["mid"] or price_data["last_trade"]
-                    if current is None:
-                        continue
-            except Exception:
+            # Skip positions held to resolution
+            if pos.get("hold_to_resolution"):
                 continue
 
-            entry = pos["entry_price"]
+            # Check if pending sell order has filled
+            pending_order = pos.get("pending_sell")
+            if pending_order:
+                try:
+                    order = self.trader.get_order(pending_order)
+                    status = order.get("status", "").lower()
+                    if status == "matched":
+                        size_matched = float(order.get("size_matched", 0))
+                        avg_price = self._get_avg_fill_price(pending_order, size_matched)
+                        # Trade history API can lag behind order status — fall back to the
+                        # limit price on the sell order (e.g. 0.29) rather than reporting 0.
+                        if avg_price == 0:
+                            avg_price = float(order.get("price", 0))
+                        entry = pos["entry_price"]
+                        pnl = (avg_price - entry) * size_matched
+                        logger.info(
+                            f"  Pending sell FILLED for {pos['bet_team']} Map {pos['map_num']} | "
+                            f"{size_matched:.2f} shares @ {avg_price:.4f} | PnL: ${pnl:+.2f}"
+                        )
+                        log_trade({
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "mode": self.mode, "match_id": pos["match_id"],
+                            "map_num": pos["map_num"],
+                            "team_a": pos["team_a"], "team_b": pos["team_b"],
+                            "side": pos["bet_team"],
+                            "model_prob": "", "market_price": "", "edge": "",
+                            "kelly_pct": "", "position_size_usd": f"{pos['position_usd']:.2f}",
+                            "entry_price": f"{entry:.4f}",
+                            "exit_price": f"{avg_price:.4f}",
+                            "exit_reason": pos.get("exit_reason", "trailing_floor"),
+                            "pnl": f"{pnl:.2f}",
+                        })
+                        try:
+                            self._record_event(pos["match_id"], pos["map_num"], "exit", pos["bet_team"], avg_price, pos.get("exit_reason", "trailing_floor"))
+                        except Exception:
+                            pass
+                        with self._positions_lock:
+                            self.positions.pop(key, None)
+                        self._save_state()
+                        notify(
+                            f"**SOLD** {pos['bet_team']} Map {pos['map_num']} | "
+                            f"{size_matched:.1f} shares @ {avg_price:.2f} | PnL: ${pnl:+.2f}"
+                        )
+                except Exception as e:
+                    logger.debug(f"  Pending sell check error: {e}")
+                continue
+
+            try:
+                price = self.trader.get_market_price(pos["token_id"])
+                current = price["best_bid"]
+                if current is None:
+                    logger.debug(f"  {pos['bet_team']} Map {pos['map_num']} — empty bid side")
+                    continue
+            except Exception as e:
+                logger.debug(f"  Price fetch error for {pos['bet_team']}: {e}")
+                continue
+
+            # Log price tick to SQLite
+            try:
+                self._record_tick(
+                    pos["match_id"], pos["map_num"],
+                    pos["token_id"], pos["bet_team"], current,
+                )
+            except Exception as e:
+                logger.debug(f"  Tick write error: {e}")
+
+            baseline = pos["entry_price"]
             high = pos["high_price"]
 
-            # Update high water mark
             if current > high:
                 with self._positions_lock:
                     if key in self.positions:
                         self.positions[key]["high_price"] = current
                 high = current
 
-            # Check stop loss (-30%)
-            stop = compute_stop_loss(entry)
-            if current <= stop:
+            stop = compute_stop_loss(baseline)
+            if stop is not None and current <= stop:
                 logger.info(
                     f"  STOP LOSS triggered for {pos['bet_team']} Map {pos['map_num']} "
-                    f"({current:.2f} <= {stop:.2f})"
+                    f"({current:.2f} <= {stop:.2f}, high {high:.2f})"
                 )
                 self._exit_position(key, current, "stop_loss")
                 continue
 
-            # Check trailing floor
-            floor = compute_floor(entry, high)
+            floor = compute_floor(baseline, high)
             if floor is not None and current <= floor:
                 logger.info(
                     f"  TRAILING FLOOR triggered for {pos['bet_team']} Map {pos['map_num']} "
-                    f"({current:.2f} <= floor {floor:.2f})"
+                    f"({current:.2f} <= floor {floor:.2f}, high {high:.2f})"
                 )
                 self._exit_position(key, current, "trailing_floor")
                 continue
+
+        # Continue recording ticks for exited positions until map resolves
+        now = time.time()
+        expired = []
+        for wkey, w in list(self._price_watchers.items()):
+            if w.get("expires_at") and now >= w["expires_at"]:
+                expired.append(wkey)
+                continue
+            try:
+                price = self.trader.get_market_price(w["token_id"])
+                bid = price["best_bid"]
+                if bid is not None:
+                    self._record_tick(
+                        w["match_id"], w["map_num"],
+                        w["token_id"], w["side"], bid,
+                    )
+            except Exception:
+                pass
+        for wkey in expired:
+            logger.info(f"  Watcher expired: {self._price_watchers[wkey]['side']} Map {self._price_watchers[wkey]['map_num']}")
+            del self._price_watchers[wkey]
 
     def _record_map_winner(self, match_id, map_num, winner):
         """Record the map winner on any open position for this map."""
@@ -825,38 +1554,224 @@ class TradingAgent:
                     )
                     break
 
+        # Schedule watcher expiry 5 min from now for this map
+        expiry = time.time() + 5 * 60
+        for wkey, w in self._price_watchers.items():
+            if w["match_id"] == match_id and w["map_num"] == map_num:
+                w["expires_at"] = expiry
+                logger.info(f"  Watcher for {w['side']} Map {map_num} expires in 5 min")
+
+    def _resolve_remaining_positions(self, match_id):
+        """
+        After a series ends, log exit rows for positions never sold
+        (e.g. sub-minimum positions held to market resolution).
+        No Polymarket action — just logs to the trade CSV.
+        """
+        with self._positions_lock:
+            match_keys = [
+                k for k, p in self.positions.items() if p["match_id"] == match_id
+            ]
+
+        for key in match_keys:
+            with self._positions_lock:
+                pos = self.positions.get(key)
+                if pos is None:
+                    continue
+
+            model_correct = pos.get("model_correct", "")
+            if model_correct == 1:
+                exit_price = 1.00
+            elif model_correct == 0:
+                exit_price = 0.00
+            else:
+                logger.warning(f"  Position {pos['bet_team']} Map {pos['map_num']} has no map winner — skipping resolution log")
+                continue
+
+            entry = pos["entry_price"]
+            shares = pos["shares"]
+            pnl = (exit_price - entry) * shares
+
+            logger.info(
+                f"  RESOLVED {pos['bet_team']} Map {pos['map_num']} | "
+                f"Entry: {entry:.2f} → Resolution: {exit_price:.2f} | "
+                f"PnL: ${pnl:+.2f}"
+            )
+
+            if self.paper:
+                self.bankroll += pos["position_usd"] + pnl
+
+            try:
+                self._record_event(pos["match_id"], pos["map_num"], "exit", pos["bet_team"], exit_price, "resolution")
+            except Exception:
+                pass
+
+            with self._positions_lock:
+                self.positions.pop(key, None)
+
+            log_trade({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "mode": self.mode,
+                "match_id": pos["match_id"],
+                "map_num": pos["map_num"],
+                "team_a": pos["team_a"],
+                "team_b": pos["team_b"],
+                "side": pos["bet_team"],
+                "model_prob": "",
+                "market_price": "",
+                "edge": "",
+                "kelly_pct": "",
+                "position_size_usd": f"{pos['position_usd']:.2f}",
+                "entry_price": f"{entry:.4f}",
+                "exit_price": f"{exit_price:.4f}",
+                "exit_reason": "resolution",
+                "pnl": f"{pnl:.2f}",
+            })
+
+        # Stop watching prices for this match — maps have resolved
+        self._price_watchers = {
+            k: w for k, w in self._price_watchers.items()
+            if w["match_id"] != match_id
+        }
+
+        with self._positions_lock:
+            has_positions = bool(self.positions)
+        if not has_positions:
+            self._clear_state()
+        else:
+            self._save_state()
+
     def _exit_position(self, pos_key, exit_price, reason):
         """Exit a position — sell or log paper exit."""
         with self._positions_lock:
-            pos = self.positions.pop(pos_key, None)
+            pos = self.positions.get(pos_key)
         if pos is None:
             return
 
         entry = pos["entry_price"]
         shares = pos["shares"]
-        pnl = (exit_price - entry) * shares
 
-        logger.info(
-            f"  EXIT {pos['bet_team']} Map {pos['map_num']} | "
-            f"Entry: {entry:.2f} → Exit: {exit_price:.2f} | "
-            f"PnL: ${pnl:+.2f} | Reason: {reason}"
-        )
+        if not self.paper:
+            # Query actual shares held (may differ from stored due to partial fills)
+            try:
+                actual_shares = self.trader.get_position(pos["token_id"])
+                if actual_shares <= 0:
+                    logger.warning(f"  No shares held for {pos['bet_team']} Map {pos['map_num']} — clearing position")
+                    with self._positions_lock:
+                        self.positions.pop(pos_key, None)
+                    return
+                if abs(actual_shares - shares) > 0.01:
+                    logger.info(f"  Actual shares: {actual_shares:.2f} (stored: {shares:.2f})")
+                shares = actual_shares
+            except Exception as e:
+                logger.error(f"  Failed to query position balance: {e}")
+                return  # Don't sell blind — retry next cycle
+
+            # Polymarket requires minimum 5 shares per order — can't sell sub-minimum positions
+            if shares < MIN_CLOB_SHARES:
+                logger.warning(
+                    f"  Can't sell {shares:.2f} shares (min {MIN_CLOB_SHARES}) — "
+                    f"holding to market resolution"
+                )
+                # Update stored shares so this doesn't re-log every cycle
+                with self._positions_lock:
+                    if pos_key in self.positions:
+                        self.positions[pos_key]["shares"] = shares
+                        self.positions[pos_key]["hold_to_resolution"] = True
+                self._save_state()
+                notify(
+                    f"**HOLD TO RESOLUTION** {pos['bet_team']} Map {pos['map_num']} | "
+                    f"{shares:.1f} shares < min {MIN_CLOB_SHARES} | {reason} triggered but can't sell"
+                )
+                return
 
         if self.paper:
+            pnl = (exit_price - entry) * shares
+            logger.info(
+                f"  EXIT {pos['bet_team']} Map {pos['map_num']} | "
+                f"Entry: {entry:.2f} → Exit: {exit_price:.2f} | "
+                f"PnL: ${pnl:+.2f} | Reason: {reason}"
+            )
             # Return capital + pnl to bankroll
             self.bankroll += pos["position_usd"] + pnl
             logger.info(f"  [PAPER] Bankroll: ${self.bankroll:.2f}")
         else:
+            # Snapshot USDC balance before sell to compute actual proceeds
             try:
-                self.trader.sell(
+                balance_before = self.trader.get_balance()
+            except Exception:
+                balance_before = None
+
+            tick = float(pos.get("tick_size", "0.01"))
+            sell_price = max(round(exit_price, 2), tick)
+            try:
+                # Floor to 6 decimals (1e6 raw units) so we never exceed on-chain balance
+                sell_shares = math.floor(shares * 1e6) / 1e6
+                resp = self.trader.sell(
                     token_id=pos["token_id"],
-                    price=round(exit_price, 2),
-                    size=round(shares, 2),
+                    price=sell_price,
+                    size=sell_shares,
                     tick_size=pos["tick_size"],
                     neg_risk=pos["neg_risk"],
                 )
+                logger.debug(f"  Sell response: {resp}")
+                order_id = resp.get("orderID") or resp.get("id")
+                if not order_id:
+                    logger.error(f"  Sell order returned no order ID: {resp}")
+                    notify(f"**SELL FAILED** {pos['bet_team']} Map {pos['map_num']} | no order ID")
+                    return
+                logger.info(f"  Sell order placed @ {sell_price:.2f}: {order_id} — polling for fill...")
             except Exception as e:
                 logger.error(f"  Sell order failed: {e}")
+                notify(f"**SELL FAILED** {pos['bet_team']} Map {pos['map_num']} | {e}")
+                return  # Keep position — retry next cycle
+
+            # Poll for fill — if not filled in 30s, leave order on the book
+            # (all trailing floors are above entry, so GTC will fill eventually)
+            fill = self._poll_fill(order_id, pos["token_id"])
+            if not fill["filled"]:
+                logger.info(f"  Sell not filled within {FILL_POLL_TIMEOUT}s — leaving GTC order on book: {order_id}")
+                # Mark position so the price monitor doesn't re-trigger exits
+                with self._positions_lock:
+                    if pos_key in self.positions:
+                        self.positions[pos_key]["pending_sell"] = order_id
+                        self.positions[pos_key]["exit_reason"] = reason
+                self._save_state()
+                return
+
+            # Compute actual exit price from USDC received / shares sold
+            try:
+                balance_after = self.trader.get_balance()
+                if balance_before is not None and sell_shares > 0:
+                    usdc_received = balance_after - balance_before
+                    if usdc_received > 0:
+                        exit_price = usdc_received / sell_shares
+                    elif fill["avg_price"] > 0:
+                        exit_price = fill["avg_price"]
+                elif fill["avg_price"] > 0:
+                    exit_price = fill["avg_price"]
+            except Exception:
+                if fill["avg_price"] > 0:
+                    exit_price = fill["avg_price"]
+
+            pnl = (exit_price - entry) * shares
+            logger.info(
+                f"  EXIT {pos['bet_team']} Map {pos['map_num']} | "
+                f"Entry: {entry:.2f} → Exit: {exit_price:.4f} | "
+                f"PnL: ${pnl:+.2f} | Reason: {reason}"
+            )
+
+        notify(
+            f"**EXIT {pos['bet_team']}** Map {pos['map_num']} | "
+            f"{entry:.2f} → {exit_price:.2f} | PnL: ${pnl:+.2f} | {reason}"
+        )
+
+        try:
+            self._record_event(pos["match_id"], pos["map_num"], "exit", pos["bet_team"], exit_price, reason)
+        except Exception as e:
+            logger.debug(f"  Event write error: {e}")
+
+        with self._positions_lock:
+            self.positions.pop(pos_key, None)
 
         log_trade({
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -875,8 +1790,6 @@ class TradingAgent:
             "exit_price": f"{exit_price:.4f}",
             "exit_reason": reason,
             "pnl": f"{pnl:.2f}",
-            "map_winner": pos.get("map_winner", ""),
-            "model_correct": pos.get("model_correct", ""),
         })
 
         # Persist state (or clean up if no positions left)
@@ -888,26 +1801,44 @@ class TradingAgent:
             self._clear_state()
 
     # ──────────────────────────────────────────────────────────
+    # ELO PRECOMPUTE
+    # ──────────────────────────────────────────────────────────
+
+    def _trigger_elo_precompute(self, reason):
+        """Kick off a background Elo snapshot rebuild.
+
+        Fire-and-forget: the Predict cache is keyed by Excel mtime, so the
+        thread reads whatever state Excel is in right now and populates the
+        cache. If the cache is already current, the thread returns fast.
+        """
+        def _run():
+            start = time.time()
+            try:
+                precompute_elo_snapshot(_PREDICT_EXCEL)
+                logger.info(f"Elo precompute ({reason}) done in {time.time()-start:.1f}s")
+            except Exception as e:
+                logger.warning(f"Elo precompute ({reason}) failed: {e}")
+        threading.Thread(target=_run, daemon=True, name=f"elo-precompute").start()
+
+    # ──────────────────────────────────────────────────────────
     # SCRAPER HELPERS
     # ──────────────────────────────────────────────────────────
 
     def _scrape_game(self, match_id, game_num):
         """Rescrape a single completed map."""
         logger.info(f"Rescraping match {match_id} game {game_num}...")
-        project_root = os.path.join(os.path.dirname(__file__), "..")
-        scraper = os.path.join(project_root, "Scraper", "main.py")
+        scraper_dir = os.path.join(os.path.dirname(__file__), "..", "Scraper")
         try:
-            os.system(f'py "{scraper}" --match {match_id} --game {game_num}')
+            os.system(f'cd /d "{scraper_dir}" && py main.py --match {match_id} --game {game_num}')
         except Exception as e:
             logger.error(f"Scrape failed: {e}")
 
     def _scrape_match(self, match_id):
         """Scrape full match after series ends."""
         logger.info(f"Scraping full match {match_id}...")
-        project_root = os.path.join(os.path.dirname(__file__), "..")
-        scraper = os.path.join(project_root, "Scraper", "main.py")
+        scraper_dir = os.path.join(os.path.dirname(__file__), "..", "Scraper")
         try:
-            os.system(f'py "{scraper}" --match {match_id}')
+            os.system(f'cd /d "{scraper_dir}" && py main.py --match {match_id}')
         except Exception as e:
             logger.error(f"Scrape failed: {e}")
 
