@@ -15,9 +15,12 @@ Usage:
     python polymatches.py "Fnatic" "ULF Esports"
 """
 
+import re
 import sys
 import requests
 from difflib import SequenceMatcher
+
+_MAP_QUESTION_RE = re.compile(r"\bmap\s+(\d+)\s+winner\b")
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 
@@ -98,7 +101,7 @@ def fetch_valorant_events(active_only=True):
     Fetch all Valorant events from the Gamma API (tag_slug=esports, filter by title).
     Returns list of event dicts that have Valorant in the title.
     """
-    params = {"tag_slug": "esports", "limit": 500}
+    params = {"tag_slug": "valorant", "limit": 500}
     if active_only:
         params["active"] = "true"
         params["closed"] = "false"
@@ -199,13 +202,15 @@ def get_match_prices(team_a, team_b, verbose=False):
         question = market.get("question", "")
         q_lower  = question.lower()
 
-        # Map-specific markets
+        # Map-specific markets — Bo3 has maps 1-3, Bo5 has maps 1-5 (Polymarket
+        # adds later-map markets lazily, so trust whatever's listed).
+        map_match = _MAP_QUESTION_RE.search(q_lower)
         found_map = False
-        for n in [1, 2, 3]:
-            if f"map {n} winner" in q_lower and n not in map_markets:
+        if map_match:
+            n = int(map_match.group(1))
+            if n not in map_markets:
                 map_markets[n] = market
                 found_map = True
-                break
 
         # Moneyline / series winner — matches event title, exclude props
         if (not found_map and "map" not in q_lower

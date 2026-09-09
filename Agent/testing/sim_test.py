@@ -64,8 +64,8 @@ def _make_scenario_2_1():
         # Simulated price paths for the price monitor (per map)
         # Each list is a sequence of prices the monitor sees over time
         "price_paths": {
-            1: _rising_then_drop(entry=0.55, peak=0.75, drop_to=0.60),
-            2: _falling(entry=0.52, bottom=0.35),
+            1: _rising_then_drop(entry=0.55, peak=0.85, drop_to=0.65),
+            2: _falling(entry=0.52, bottom=0.32),
             3: [],  # no position, no prices needed
         },
         # Poller states: list of dicts returned by poll_match_status
@@ -84,10 +84,15 @@ def _make_scenario_2_1():
             {"is_live": True, "is_final": False, "maps": {
                 1: {"final": True, "score_a": 13, "score_b": 10, "map_name": "Ascent"},
             }},
-            # Map 2 in progress
+            # Map 2 in progress (consumed by _between_maps to find map name)
             {"is_live": True, "is_final": False, "maps": {
                 1: {"final": True, "score_a": 13, "score_b": 10, "map_name": "Ascent"},
                 2: {"final": False, "score_a": 5, "score_b": 6, "map_name": "Bind"},
+            }},
+            # Map 2 still in progress (held by main poll loop -> monitor pumps -> stop loss fires)
+            {"is_live": True, "is_final": False, "maps": {
+                1: {"final": True, "score_a": 13, "score_b": 10, "map_name": "Ascent"},
+                2: {"final": False, "score_a": 7, "score_b": 9, "map_name": "Bind"},
             }},
             # Map 2 final (10-13, team_b wins)
             {"is_live": True, "is_final": False, "maps": {
@@ -122,8 +127,8 @@ def _make_scenario_2_0():
             2: {"price_a": 0.60, "price_b": 0.40},   # 8% edge
         },
         "price_paths": {
-            1: _rising_then_drop(entry=0.58, peak=0.78, drop_to=0.63),
-            2: _rising_then_drop(entry=0.60, peak=0.80, drop_to=0.65),
+            1: _rising_then_drop(entry=0.58, peak=0.90, drop_to=0.70),
+            2: _rising_then_drop(entry=0.60, peak=0.93, drop_to=0.72),
         },
         "poller_sequence": [
             {"is_live": False, "is_final": False, "maps": {}},
@@ -227,8 +232,11 @@ class MockState:
     def __init__(self, scenario):
         self.scenario = scenario
         self.poller_index = 0
-        self.price_path_index = {}  # map_num -> current index
+        self.price_path_index = {}  # token_id -> current index (per-token ladder)
         self.events = []  # log of significant events for verification
+        self.agent = None   # set after agent construction; lets the mock poller
+                            # pump the price monitor in lockstep with polling
+        self.hold_calls = {}  # poller_index -> times held (caps runaway holds)
 
     def log(self, msg):
         self.events.append(msg)
@@ -255,10 +263,37 @@ def build_mocks(state):
         }]
 
     # -- Mock poller: returns next state in sequence --
+    # Hold logic: if the current state has an in_progress map with an open
+    # position, pump the price monitor and DON'T advance. The price path
+    # clamps at its last value, so eventually the position monitor either
+    # sees the trough and fires the floor/stop, or the hard cap (50 holds
+    # per state) advances anyway.
+    HOLD_CAP = 50
+
     def mock_poll_match_status(match_url, session=None):
         idx = min(state.poller_index, len(scenario["poller_sequence"]) - 1)
         status = scenario["poller_sequence"][idx]
-        state.poller_index += 1
+        status.setdefault("maps_to_win", 2)
+
+        should_hold = False
+        if state.agent is not None and state.hold_calls.get(idx, 0) < HOLD_CAP:
+            for map_num, map_info in status["maps"].items():
+                if map_info["final"]:
+                    continue
+                has_position = any(
+                    p.get("map_num") == map_num
+                    for p in state.agent.positions.values()
+                )
+                if has_position:
+                    should_hold = True
+                    break
+
+        if should_hold:
+            state.agent._check_all_positions()
+            state.hold_calls[idx] = state.hold_calls.get(idx, 0) + 1
+        else:
+            state.poller_index += 1
+
         return status
 
     # -- Mock model: returns configured probability --
@@ -313,19 +348,30 @@ def build_mocks(state):
             }
 
         def get_market_price(self, token_id):
-            # Figure out which map this token belongs to
+            # Per-token ladder: each token_id has its own index. TOKEN_A reads
+            # from the configured price path; TOKEN_B returns the binary
+            # complement (1 - price). Once the path exhausts, the last value
+            # is returned indefinitely so the position monitor keeps seeing
+            # the trough until the floor/stop fires.
             for map_num, prices in scenario["market_prices"].items():
                 expected_a = f"TOKEN_A_SIM_COND_{map_num}"
                 expected_b = f"TOKEN_B_SIM_COND_{map_num}"
-                if token_id in (expected_a, expected_b):
-                    path = scenario["price_paths"].get(map_num, [])
-                    idx = state.price_path_index.get(map_num, 0)
-                    if idx < len(path):
-                        price = path[idx]
-                        state.price_path_index[map_num] = idx + 1
-                        return {"mid": price, "last_trade": price, "best_bid": price - 0.01, "best_ask": price + 0.01}
-                    elif path:
-                        return {"mid": path[-1], "last_trade": path[-1], "best_bid": path[-1] - 0.01, "best_ask": path[-1] + 0.01}
+                if token_id not in (expected_a, expected_b):
+                    continue
+                path = scenario["price_paths"].get(map_num, [])
+                if not path:
+                    return {"mid": None, "last_trade": None, "best_bid": None, "best_ask": None}
+                idx = state.price_path_index.get(token_id, 0)
+                clamped = min(idx, len(path) - 1)
+                raw = path[clamped]
+                state.price_path_index[token_id] = idx + 1
+                price = raw if token_id == expected_a else round(1 - raw, 4)
+                return {
+                    "mid": price,
+                    "last_trade": price,
+                    "best_bid": round(max(0.01, price - 0.01), 4),
+                    "best_ask": round(min(0.99, price + 0.01), 4),
+                }
             return {"mid": None, "last_trade": None, "best_bid": None, "best_ask": None}
 
         def buy(self, **kwargs):
@@ -409,14 +455,17 @@ def run_simulation(scenario_name="2-1", verbose=False):
         # Create agent in paper mode with mock trader
         agent = TradingAgent(paper=True, bankroll=1000)
         agent.trader = mocks["trader_class"]()
+        state.agent = agent  # let the mock poller pump the price monitor
 
-        # Run one cycle (not the infinite loop)
-        # Don't use the background price monitor thread — it's non-deterministic.
-        # Instead, manually pump the price monitor after the cycle completes.
-        agent._monitor_running = False  # prevent auto-start from doing anything
+        # Run one cycle (not the infinite loop). The mock poller pumps the
+        # price monitor in lockstep with polling, so floor/stop fire on the
+        # configured price path before maps go final. Background monitor stays
+        # off for determinism.
+        agent._monitor_running = False
         agent._run_cycle()
 
-        # Manually pump price monitor to process any remaining open positions
+        # Safety net: any positions still open (e.g. bug in hold logic) get
+        # cleared synchronously so the test doesn't hang.
         for _ in range(50):
             if not agent.positions:
                 break
@@ -462,14 +511,19 @@ def run_simulation(scenario_name="2-1", verbose=False):
 
         if scenario_name == "2-1":
             # Map 1: entry + exit (trailing floor)
-            # Map 2: entry + exit (stop loss)
+            # Map 2: entry + exit (resolution loss -- stop loss disabled, falling
+            #        price path now rides to map resolution where team_b wins)
             # Map 3: no edge -> skipped
             entries = [t for t in trade_log if t.get("exit_reason") == "open"]
             exits = [t for t in trade_log if t.get("exit_reason") not in ("open", "no_edge")]
             no_edges = [t for t in trade_log if t.get("exit_reason") == "no_edge"]
+            floor_exits = [t for t in exits if t.get("exit_reason") == "trailing_floor"]
+            resolution_exits = [t for t in exits if t.get("exit_reason") == "resolution"]
 
             check("Map 1+2 entered (2 entries)", len(entries) == 2)
-            check("Map 1+2 exited (2 exits)", len(exits) >= 1)
+            check("Map 1+2 exited (2 exits)", len(exits) >= 2)
+            check("Map 1 exited via trailing_floor", len(floor_exits) >= 1)
+            check("Map 2 exited via resolution", len(resolution_exits) >= 1)
             check("Map 3 skipped (no edge)", len(no_edges) >= 1)
             check("No open positions remain", len(agent.positions) == 0)
             check("Bankroll changed from $1000", agent.bankroll != 1000)
@@ -477,9 +531,11 @@ def run_simulation(scenario_name="2-1", verbose=False):
         elif scenario_name == "2-0":
             entries = [t for t in trade_log if t.get("exit_reason") == "open"]
             exits = [t for t in trade_log if t.get("exit_reason") not in ("open", "no_edge")]
+            floor_exits = [t for t in exits if t.get("exit_reason") == "trailing_floor"]
 
             check("Both maps entered (2 entries)", len(entries) == 2)
-            check("Both maps exited", len(exits) >= 1)
+            check("Both maps exited (2 exits)", len(exits) >= 2)
+            check("Both exits via trailing_floor", len(floor_exits) >= 2)
             check("No open positions remain", len(agent.positions) == 0)
 
         elif scenario_name == "no-edge":

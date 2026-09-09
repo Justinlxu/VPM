@@ -13,10 +13,9 @@ Usage:
 
 import os
 from dotenv import load_dotenv
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import (
-    ApiCreds, OrderArgs, OrderType,
-    PartialCreateOrderOptions, BookParams,
+from py_clob_client_v2 import (
+    ClobClient, ApiCreds, OrderArgs, OrderType,
+    PartialCreateOrderOptions, OrderPayload,
 )
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
@@ -118,8 +117,11 @@ class PolyTrader:
             tick_size=tick_size,
             neg_risk=neg_risk,
         )
-        signed = self.client.create_order(order_args, options)
-        return self.client.post_order(signed, orderType=OrderType.GTC)
+        return self.client.create_and_post_order(
+            order_args=order_args,
+            options=options,
+            order_type=OrderType.GTC,
+        )
 
     def sell(self, token_id, price, size, tick_size="0.01", neg_risk=False):
         """
@@ -152,8 +154,11 @@ class PolyTrader:
             tick_size=tick_size,
             neg_risk=neg_risk,
         )
-        signed = self.client.create_order(order_args, options)
-        return self.client.post_order(signed, orderType=OrderType.GTC)
+        return self.client.create_and_post_order(
+            order_args=order_args,
+            options=options,
+            order_type=OrderType.GTC,
+        )
 
     # ══════════════════════════════════════════════════════════════
     # ORDER MANAGEMENT
@@ -165,7 +170,7 @@ class PolyTrader:
 
     def cancel(self, order_id):
         """Cancel a single order by ID."""
-        return self.client.cancel(order_id)
+        return self.client.cancel_order(OrderPayload(orderID=order_id))
 
     def cancel_all(self):
         """Cancel all open orders."""
@@ -173,14 +178,14 @@ class PolyTrader:
 
     def get_open_orders(self):
         """Return list of all open orders."""
-        return self.client.get_orders()
+        return self.client.get_open_orders()
 
     def get_trades_for_order(self, order_id):
         """
         Get trades associated with a specific order.
         Returns list of trade dicts with 'price' and 'size' fields.
         """
-        from py_clob_client.clob_types import TradeParams
+        from py_clob_client_v2 import TradeParams
         trades = self.client.get_trades(TradeParams(id=order_id))
         return trades
 
@@ -196,7 +201,7 @@ class PolyTrader:
         -------
         float : USDC balance
         """
-        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        from py_clob_client_v2 import BalanceAllowanceParams, AssetType
         params = BalanceAllowanceParams(
             asset_type=AssetType.COLLATERAL,
         )
@@ -211,7 +216,7 @@ class PolyTrader:
         -------
         float : number of shares held (in normal units, not raw)
         """
-        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        from py_clob_client_v2 import BalanceAllowanceParams, AssetType
         params = BalanceAllowanceParams(
             asset_type=AssetType.CONDITIONAL,
             token_id=token_id,
@@ -224,7 +229,7 @@ class PolyTrader:
         Approve conditional token for trading (required before selling).
         Must be called after buying tokens to enable sells.
         """
-        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        from py_clob_client_v2 import BalanceAllowanceParams, AssetType
         params = BalanceAllowanceParams(
             asset_type=AssetType.CONDITIONAL,
             token_id=token_id,
@@ -251,22 +256,21 @@ class PolyTrader:
         """
         book = self.client.get_order_book(token_id)
 
-        best_bid = None
-        best_ask = None
+        bids = book.get("bids") or []
+        asks = book.get("asks") or []
 
-        if book.bids:
-            best_bid = max(float(b.price) for b in book.bids)
-        if book.asks:
-            best_ask = min(float(a.price) for a in book.asks)
+        best_bid = max((float(b["price"]) for b in bids), default=None)
+        best_ask = min((float(a["price"]) for a in asks), default=None)
 
         mid = None
         if best_bid is not None and best_ask is not None:
             mid = (best_bid + best_ask) / 2
 
         last_trade = None
-        if book.last_trade_price:
+        ltp = book.get("last_trade_price")
+        if ltp:
             try:
-                last_trade = float(book.last_trade_price)
+                last_trade = float(ltp)
             except (ValueError, TypeError):
                 pass
 

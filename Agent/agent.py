@@ -46,18 +46,23 @@ from Predict.predict import predict_elo_only, precompute_elo_snapshot, EXCEL_FIL
 
 EDGE_THRESHOLD = 0.05          # 5% minimum edge to enter
 MAX_CONFIDENCE = 0.70          # cap model probability at 70% (either side)
-STOP_LOSS_PCT = None           # disabled -- set to e.g. -0.30 to re-enable
+STOP_LOSS_PCT = None           # disabled 2026-05-16 -- floor_search on N=89 (50.6% win rate)
 # Trailing floor ladder: (gain_threshold, floor_offset) pairs.
-# Activates early (+16%) with tight gaps to capture the model's decaying edge
-# and salvage wrong trades during temporary price spikes.  Past the last
-# explicit tier, the floor tracks in 6% steps.
+# Activates later (+38%) with wider ~25% gaps -- top config from event-only
+# floor_search on real recorded ticks (29 paths, 37.9% pool win rate).
+# Pattern: clip losers with the stop loss, let winners run further before
+# the floor engages, then trail in wide steps so a single round swing
+# doesn't chop-exit a real winner.
 TRAILING_FLOOR_LADDER = (
-    (0.16, 0.09),   # +16% peak → floor +9%  (gap 7%)
-    (0.27, 0.21),   # +27% peak → floor +21% (gap 6%)
-    (0.38, 0.34),   # +38% peak → floor +34% (gap 4%)
+    (0.38, 0.13),   # +38% peak → floor +13% (gap 25%)
+    (0.50, 0.26),   # +50% peak → floor +26% (gap 25%)
+    (0.62, 0.39),   # +62% peak → floor +39% (gap 24%)
+    (0.75, 0.52),   # +75% peak → floor +52% (gap 23%)
+    (0.87, 0.64),   # +87% peak → floor +64% (gap 23%)
+    (0.99, 0.77),   # +99% peak → floor +77% (gap 22%)
 )
 TRAILING_FLOOR_START = TRAILING_FLOOR_LADDER[0][0]
-TRAILING_FLOOR_STEP = 0.06     # ladder granularity past the last explicit tier
+TRAILING_FLOOR_STEP = 0.08     # ladder granularity past the last explicit tier
 ENTRY_WINDOW_SECS = 5 * 60    # 5 min entry window for maps 2/3
 COOLDOWN_SECS = 5 * 60         # 5 min cooldown after map final
 POST_MATCH_REPOLL_DELAY = 5 * 60  # wait 5 min after a match ends before repolling (VLR ETA lag)
@@ -67,7 +72,7 @@ PRICE_MONITOR_INTERVAL = 1     # price check interval (seconds)
 FILL_POLL_INTERVAL = 2         # order fill check interval (seconds)
 FILL_POLL_TIMEOUT = 30         # max seconds to wait for a fill
 MIN_CLOB_SHARES = 5            # Polymarket minimum order size in shares
-MIN_BUY_SHARES = 5.25          # Buy above 5 so post-fee balance stays >= MIN_CLOB_SHARES
+MIN_BUY_SHARES = 5.5           # Buy above 5 so post-fee balance stays >= MIN_CLOB_SHARES
 DEFAULT_PAPER_BANKROLL = 1000  # $1000 default paper bankroll
 
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
@@ -171,11 +176,8 @@ def compute_floor(entry_price, high_price):
     """
     Compute the current exit floor based on entry price and highest price seen.
 
-    Uses TRAILING_FLOOR_LADDER for the explicit tiers (+30% through +60%), then
-    tracks in 10% steps with a 10% gap past the last explicit tier. The ladder
-    tightens as the trade deepens because per-round price volatility scales with
-    p*(1-p) — a round swing near 0.50 is ~8c, near 0.80 is ~4c, near 0.90 is ~2c,
-    so a tighter gap at high tiers is matched to the lower volatility there.
+    Uses TRAILING_FLOOR_LADDER for the explicit tiers, then tracks in
+    TRAILING_FLOOR_STEP increments past the last explicit tier.
 
     Returns the floor price, or None if gain hasn't reached the first tier.
     """
@@ -184,10 +186,10 @@ def compute_floor(entry_price, high_price):
 
     gain_pct = (high_price - entry_price) / entry_price
 
-    if gain_pct < TRAILING_FLOOR_START:
+    eps = 1e-9
+    if gain_pct + eps < TRAILING_FLOOR_START:
         return None
 
-    eps = 1e-9
     floor_offset = None
     for threshold, offset in TRAILING_FLOOR_LADDER:
         if gain_pct + eps >= threshold:
@@ -257,6 +259,12 @@ class TradingAgent:
         # Active match threads: match_id -> Thread
         self._active_matches = {}
         self._active_matches_lock = threading.Lock()
+
+        # match_id -> finish_timestamp (unix). Prevents re-dispatching a match
+        # that just completed if VLR still lists it as live (e.g. a poller bug
+        # falsely flags is_final and we re-fetch /matches 5 min later).
+        self._recently_completed = {}
+        self._recently_completed_ttl = 6 * 60 * 60  # 6 hours
 
         # Event to wake the main loop when a match thread finishes
         self._match_done = threading.Event()
@@ -548,6 +556,14 @@ class TradingAgent:
             for mid in done:
                 self._active_matches.pop(mid)
 
+        # Expire stale entries from the recently-completed dedupe map
+        now_ts = time.time()
+        with self._active_matches_lock:
+            expired = [mid for mid, ts in self._recently_completed.items()
+                       if now_ts - ts > self._recently_completed_ttl]
+            for mid in expired:
+                self._recently_completed.pop(mid)
+
         logger.info("Fetching upcoming VCT matches...")
         matches = get_upcoming_matches(vct_only=True)
 
@@ -566,6 +582,8 @@ class TradingAgent:
             with self._active_matches_lock:
                 if m["match_id"] in self._active_matches:
                     continue  # Already being handled
+                if m["match_id"] in self._recently_completed:
+                    continue  # Just finished — VLR hasn't dropped it from /matches yet
             if m["is_live"]:
                 actionable.append(m)
             elif m["start_time"] is not None:
@@ -645,6 +663,7 @@ class TradingAgent:
         finally:
             with self._active_matches_lock:
                 self._active_matches.pop(match["match_id"], None)
+                self._recently_completed[match["match_id"]] = time.time()
             # VLR doesn't update the next match's ETA the instant this one ends.
             # Give it a buffer so the repoll sees the refreshed relative countdown.
             time.sleep(POST_MATCH_REPOLL_DELAY)
@@ -655,7 +674,7 @@ class TradingAgent:
     # ──────────────────────────────────────────────────────────
 
     def _handle_match(self, match):
-        """Handle a full match (up to 3 maps)."""
+        """Handle a full match (Bo3: up to 3 maps, Bo5: up to 5)."""
         team_a = match["team_a"]
         team_b = match["team_b"]
         match_url = match["match_url"]
@@ -680,7 +699,9 @@ class TradingAgent:
         if not match["is_live"]:
             map1_name = self._wait_for_veto(match_url)
             logger.info(f"Map 1 veto detected: {map1_name} — entry window OPEN (5 min)")
-            self._retry_entry_until_filled(team_a, team_b, match_id, map_num=1, map_name=map1_name)
+            # Format unknown at this point; default Bo3. Moneyline preference
+            # for the decider map gets the real value once we poll below.
+            self._retry_entry_until_filled(team_a, team_b, match_id, map_num=1, map_name=map1_name, max_maps=3)
         else:
             logger.info("Match already live — skipping Map 1 entry")
 
@@ -688,6 +709,10 @@ class TradingAgent:
         # Seed prev_finals with maps already final (skip cooldown for those)
         prev_finals = set()
         initial_status = poll_match_status(match_url)
+        # Bo3 = 2 wins / max 3 maps, Bo5 = 3 wins / max 5 maps. Default Bo3 if
+        # the format note couldn't be parsed.
+        maps_to_win = initial_status["maps_to_win"] if initial_status else 2
+        max_maps = 2 * maps_to_win - 1
         if initial_status:
             for map_num, map_data in initial_status["maps"].items():
                 if map_data["final"]:
@@ -695,8 +720,7 @@ class TradingAgent:
                     logger.info(f"Map {map_num} already FINAL ({score}) — skipping cooldown")
                     prev_finals.add(map_num)
 
-            # If maps are already done but series isn't over, enter the next map now
-            # Only enter Map 3 if series is tied 1-1
+            # If maps are already done but series isn't over, enter the next map
             if prev_finals and not initial_status["is_final"]:
                 wins_a = sum(
                     1 for m in initial_status["maps"].values()
@@ -706,11 +730,11 @@ class TradingAgent:
                     1 for m in initial_status["maps"].values()
                     if m["final"] and m["score_b"] > m["score_a"]
                 )
-                if wins_a >= 2 or wins_b >= 2:
+                if wins_a >= maps_to_win or wins_b >= maps_to_win:
                     logger.info("Series already decided — no more maps")
                 else:
                     next_map = max(prev_finals) + 1
-                    if next_map <= 3:
+                    if next_map <= max_maps:
                         # Skip if the next map is already live (rounds being played)
                         next_map_data = initial_status["maps"].get(next_map)
                         if next_map_data and (next_map_data["score_a"] + next_map_data["score_b"]) > 0:
@@ -719,7 +743,7 @@ class TradingAgent:
                             next_map_name = next_map_data.get("map_name") if next_map_data else None
                             map_label = f" ({next_map_name})" if next_map_name else ""
                             logger.info(f"Map {next_map}{map_label} entry window OPEN (5 min)")
-                            self._retry_entry_until_filled(team_a, team_b, match_id, map_num=next_map, map_name=next_map_name)
+                            self._retry_entry_until_filled(team_a, team_b, match_id, map_num=next_map, map_name=next_map_name, max_maps=max_maps)
 
         series_over = False
 
@@ -746,8 +770,8 @@ class TradingAgent:
                     self._record_map_winner(match_id, map_num, map_winner)
 
                     next_map = map_num + 1
-                    if next_map <= 3:
-                        # Check if one team already has 2 wins (series decided)
+                    if next_map <= max_maps:
+                        # Check if either team has clinched (series decided)
                         wins_a = sum(
                             1 for m in status["maps"].values()
                             if m["final"] and m["score_a"] > m["score_b"]
@@ -756,14 +780,14 @@ class TradingAgent:
                             1 for m in status["maps"].values()
                             if m["final"] and m["score_b"] > m["score_a"]
                         )
-                        if wins_a >= 2 or wins_b >= 2:
+                        if wins_a >= maps_to_win or wins_b >= maps_to_win:
                             logger.info("Series decided — no more maps")
                             series_over = True
                             break
 
                         # Cooldown + rescrape + entry for next map
                         self._between_maps(
-                            team_a, team_b, match_id, match_url, map_num, next_map
+                            team_a, team_b, match_id, match_url, map_num, next_map, max_maps=max_maps
                         )
 
             if not series_over:
@@ -808,12 +832,12 @@ class TradingAgent:
     # ENTRY WINDOW
     # ──────────────────────────────────────────────────────────
 
-    def _retry_entry_until_filled(self, team_a, team_b, match_id, map_num, map_name=None):
+    def _retry_entry_until_filled(self, team_a, team_b, match_id, map_num, map_name=None, max_maps=3):
         """Retry _enter_map with fresh prices until filled or entry window expires."""
         deadline = time.time() + ENTRY_WINDOW_SECS
         cached_prediction = None
         while time.time() < deadline:
-            result, prediction = self._enter_map(team_a, team_b, match_id, map_num, map_name=map_name, cached_prediction=cached_prediction)
+            result, prediction = self._enter_map(team_a, team_b, match_id, map_num, map_name=map_name, cached_prediction=cached_prediction, max_maps=max_maps)
             if result == "no_edge":
                 logger.info(f"  No edge detected — skipping retries, waiting for next map")
                 break
@@ -864,7 +888,7 @@ class TradingAgent:
             except Exception as e:
                 logger.error(f"Error cancelling order {order_id}: {e}")
 
-    def _between_maps(self, team_a, team_b, match_id, match_url, finished_map, next_map):
+    def _between_maps(self, team_a, team_b, match_id, match_url, finished_map, next_map, max_maps=3):
         """Cooldown, rescrape, then open entry for next map."""
         logger.info(f"Map {finished_map} done — {COOLDOWN_SECS//60} min cooldown")
 
@@ -893,13 +917,13 @@ class TradingAgent:
 
         map_label = f" ({next_map_name})" if next_map_name else " (unknown map)"
         logger.info(f"Map {next_map}{map_label} entry window OPEN (5 min)")
-        self._retry_entry_until_filled(team_a, team_b, match_id, map_num=next_map, map_name=next_map_name)
+        self._retry_entry_until_filled(team_a, team_b, match_id, map_num=next_map, map_name=next_map_name, max_maps=max_maps)
 
     # ──────────────────────────────────────────────────────────
     # EDGE DETECTION & ENTRY
     # ──────────────────────────────────────────────────────────
 
-    def _enter_map(self, team_a, team_b, match_id, map_num, map_name=None, cached_prediction=None):
+    def _enter_map(self, team_a, team_b, match_id, map_num, map_name=None, cached_prediction=None, max_maps=3):
         """Check edge and enter a position if edge > threshold. Returns (result, prediction) tuple."""
         map_label = f" ({map_name})" if map_name else ""
         logger.info(f"Checking edge for Map {map_num}{map_label}: {team_a} vs {team_b}")
@@ -961,15 +985,18 @@ class TradingAgent:
             logger.warning(f"  No Polymarket markets found")
             return False, prediction
 
-        # For Map 3, prefer moneyline (higher volume, same bet)
+        # On the series-deciding map (Map 3 in Bo3, Map 5 in Bo5), prefer
+        # moneyline — same bet as the map winner since the series ends here,
+        # but moneyline has higher volume. Earlier maps in a Bo5 must use the
+        # per-map market because moneyline ≠ that map's winner.
         map_market = None
         market_source = f"Map {map_num}"
         is_moneyline = False
-        if map_num == 3 and prices.get("moneyline"):
+        if map_num == max_maps and prices.get("moneyline"):
             map_market = prices["moneyline"]
             market_source = "Moneyline"
             is_moneyline = True
-            logger.info(f"  Using moneyline market for Map 3 (higher volume)")
+            logger.info(f"  Using moneyline market for Map {map_num} decider (higher volume)")
         elif map_num in prices["maps"]:
             map_market = prices["maps"][map_num]
 

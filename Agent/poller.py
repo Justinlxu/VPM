@@ -10,6 +10,7 @@ Usage:
     status = poll_match_status("https://www.vlr.gg/123456/...")
 """
 
+import re
 import time
 import requests
 from bs4 import BeautifulSoup
@@ -33,8 +34,9 @@ def poll_match_status(match_url, session=None):
     -------
     dict:
         {
-            "is_live":  bool,   # match page shows the series is underway
-            "is_final": bool,   # entire series is complete
+            "is_live":     bool,   # match page shows the series is underway
+            "is_final":    bool,   # entire series is complete
+            "maps_to_win": int,    # 2 for Bo3, 3 for Bo5 (default 2 if undetected)
             "maps": {
                 1: {"final": bool, "score_a": int, "score_b": int},
                 2: { ... },
@@ -90,13 +92,23 @@ def _parse_match_page(soup):
     # VLR shows a note near the match header: "LIVE", "final", or nothing
     is_live  = False
     is_final = False
+    maps_to_win = 2  # Bo3 default; overridden below if a "BoN" note is present
 
-    note_el = soup.select_one(".match-header-vs-note")
-    if note_el:
-        note_text = note_el.text.strip().lower()
-        if "live" in note_text:
+    # VLR renders two .match-header-vs-note elements: one for status
+    # ("live"/"final"/relative-eta), one for format ("Bo3"/"Bo5"). Order isn't
+    # guaranteed, so classify each by content.
+    for note in soup.select(".match-header-vs-note"):
+        note_text = note.text.strip()
+        m = re.match(r"^Bo(\d+)$", note_text, re.IGNORECASE)
+        if m:
+            n = int(m.group(1))
+            if n >= 1:
+                maps_to_win = n // 2 + 1  # Bo3 -> 2, Bo5 -> 3, Bo7 -> 4
+            continue
+        low = note_text.lower()
+        if "live" in low:
             is_live = True
-        elif "final" in note_text or "completed" in note_text:
+        elif "final" in low or "completed" in low:
             is_final = True
 
     # Fallback: if any map has a score, the match has started
@@ -106,15 +118,37 @@ def _parse_match_page(soup):
     # .vm-stats-game .map span shows "TBD" until the map actually loads in-game)
     veto_picks = _parse_veto_picks(soup)
 
+    # ── Build data-game-id -> map_num from the nav tabs ──────
+    # VLR sorts .vm-stats-game sections by data-game-id ascending, NOT by map
+    # order. When a map's game-id was assigned later than later-scheduled maps
+    # (e.g. Pearl with id 269000 between maps with ids 265477-265481), counting
+    # DOM position mis-numbers that map. The .vm-stats-gamesnav-item tabs are
+    # rendered in true map order — use them as the authority.
+    gid_to_map_num = {}
+    next_map_num = 1
+    for nav in soup.select(".vm-stats-gamesnav-item"):
+        classes = nav.get("class", []) or []
+        if "mod-all" in classes:
+            continue
+        gid = nav.get("data-game-id", "")
+        if gid:
+            gid_to_map_num[gid] = next_map_num
+            next_map_num += 1
+
     # ── Per-map scores ────────────────────────────────────────
     maps = {}
-    game_number = 0
+    fallback_counter = 0
 
     for section in soup.select(".vm-stats-game"):
         game_id = section.get("data-game-id", "")
         if game_id == "all":
             continue
-        game_number += 1
+        if game_id in gid_to_map_num:
+            game_number = gid_to_map_num[game_id]
+        else:
+            # Defensive: nav missing for this gid. Fall back to DOM order.
+            fallback_counter += 1
+            game_number = fallback_counter
 
         # Extract map name from the game header
         map_name = None
@@ -163,16 +197,21 @@ def _parse_match_page(soup):
         if any_scores:
             is_live = True
 
-    # Series is final when one team has won 2 maps (Bo3)
+    # Series is final when one team reaches the win threshold (Bo3: 2, Bo5: 3).
     wins_a = sum(1 for m in maps.values() if m["final"] and m["score_a"] > m["score_b"])
     wins_b = sum(1 for m in maps.values() if m["final"] and m["score_b"] > m["score_a"])
-    if wins_a >= 2 or wins_b >= 2:
+    if wins_a >= maps_to_win or wins_b >= maps_to_win:
         is_final = True
 
+    # Sort by map_num so downstream consumers iterating .items() see Map 1, 2, 3...
+    # even when VLR's DOM order doesn't match map order.
+    maps = {n: maps[n] for n in sorted(maps)}
+
     return {
-        "is_live":  is_live,
-        "is_final": is_final,
-        "maps":     maps,
+        "is_live":     is_live,
+        "is_final":    is_final,
+        "maps_to_win": maps_to_win,
+        "maps":        maps,
     }
 
 

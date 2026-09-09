@@ -30,6 +30,7 @@ from Agent.agent import (
     quarter_kelly, EDGE_THRESHOLD, STOP_LOSS_PCT,
     TRAILING_FLOOR_LADDER, TRAILING_FLOOR_STEP,
 )
+from Agent.testing.replay_paths import load_paths as _load_real_paths
 
 
 # ══════════════════════════════════════════════════════════════
@@ -249,6 +250,40 @@ def generate_paths(n, seed=42):
 
 
 # ══════════════════════════════════════════════════════════════
+# REAL PATH REPLAY (from agent.db price_ticks)
+# ══════════════════════════════════════════════════════════════
+
+def load_real_paths(dedupe=False, seed=42, event_only=False):
+    """Load real recorded paths from agent.db. Returns (paths, counts)."""
+    return _load_real_paths(dedupe=dedupe, dedupe_seed=seed, event_only=event_only)
+
+
+def bootstrap_real_paths(real_paths, n, seed):
+    """Bootstrap n paths from real_paths and synthesize Kelly inputs.
+
+    model_prob/edge are sampled in the same range as generate_paths so that
+    bankroll dynamics and per-trade sizing are comparable across modes; the
+    only thing that changes is the price trajectory after entry.
+    """
+    rng = random.Random(seed)
+    out = []
+    wins = 0
+    while len(out) < n:
+        p = rng.choice(real_paths)
+        entry = p["entry_price"]
+        edge = round(rng.uniform(0.05, 0.10), 4)
+        model_prob = min(entry + edge, 0.70)
+        edge = round(model_prob - entry, 4)
+        if edge < EDGE_THRESHOLD:
+            continue
+        prices = [entry] + [px for _, px in p["ticks"]]
+        out.append((entry, model_prob, edge, prices, p["final_outcome"]))
+        if p["final_outcome"] == 1.0:
+            wins += 1
+    return out, wins
+
+
+# ══════════════════════════════════════════════════════════════
 # FLOOR CONFIGURATIONS
 # ══════════════════════════════════════════════════════════════
 
@@ -371,7 +406,7 @@ def evaluate_config(cfg, paths, starting_bankroll=1000.0):
             continue
 
         shares = position_usd / entry_price
-        stop = entry_price * (1 + cfg["stop_loss"])
+        stop = entry_price * (1 + cfg["stop_loss"]) if cfg["stop_loss"] is not None else None
         high = entry_price
         exit_price = None
         exit_reason = None
@@ -380,7 +415,7 @@ def evaluate_config(cfg, paths, starting_bankroll=1000.0):
             if price > high:
                 high = price
 
-            if price <= stop:
+            if stop is not None and price <= stop:
                 exit_price = price
                 exit_reason = "stop_loss"
                 break
@@ -491,6 +526,12 @@ def _fmt_start(ladder):
     return f"+{ladder[0][0]:.0%}"
 
 
+def _fmt_stop(stop_loss):
+    if stop_loss is None:
+        return "off"
+    return f"{stop_loss:+.0%}"
+
+
 def _fmt_ladder_full(cfg):
     """Full ladder for the best config display."""
     ladder = cfg["ladder"]
@@ -537,6 +578,21 @@ def main():
         "--stop", type=float, default=None,
         help="Fix stop loss for all random configs (e.g. -0.50)",
     )
+    parser.add_argument(
+        "--paths", choices=["real", "synthetic"], default="real",
+        help="Path source: real (replay agent.db ticks, default) or synthetic",
+    )
+    parser.add_argument(
+        "--dedupe", action="store_true",
+        help="When --paths real: keep one path per (match,map). For bet maps, keeps "
+             "only the bet side; for unbet maps, picks one side at random. Removes "
+             "complement-mirror double-counting that biases bootstrap toward 50%% wins.",
+    )
+    parser.add_argument(
+        "--event-only", dest="event_only", action="store_true",
+        help="When --paths real: keep ONLY event-anchored paths (real bets the agent "
+             "placed). Strictest unbiased sample at the cost of N.",
+    )
     args = parser.parse_args()
 
     # ── Step 1: Build all configs ─────────────────────────
@@ -551,13 +607,44 @@ def main():
     # Each season gets its own seed, paths, and fresh bankroll
     all_metrics = [[] for _ in range(n_configs)]
 
+    real_paths = None
+    if args.paths == "real":
+        real_paths, counts = load_real_paths(
+            dedupe=args.dedupe, seed=args.seed, event_only=args.event_only,
+        )
+        mode = []
+        if args.event_only:
+            mode.append("event-only")
+        if args.dedupe:
+            mode.append("deduped")
+        mode_str = f" ({', '.join(mode)})" if mode else ""
+        print(f"\nReal paths from agent.db: {len(real_paths)} usable{mode_str}")
+        print(f"  event-anchored:      {counts['event']}")
+        print(f"  heuristic-anchored:  {counts['heuristic']}")
+        print(f"  skipped (no window):       {counts['skip_no_window']}, "
+              f"(short post-entry): {counts['skip_short_post']}, "
+              f"(unresolved): {counts['skip_unresolved']}")
+        if args.dedupe:
+            print(f"  dedupe dropped:      {counts.get('dedupe_dropped', 0)}")
+        # Pool win rate sanity print
+        if real_paths:
+            pwins = sum(1 for p in real_paths if p["final_outcome"] == 1.0)
+            print(f"  pool win rate:       {pwins}/{len(real_paths)} = "
+                  f"{pwins/len(real_paths):.1%}")
+        if not real_paths:
+            print("\nNo real paths available -- falling back to synthetic.")
+            args.paths = "synthetic"
+
     print(f"\nRunning {args.seasons} seasons x {args.trades} trades "
-          f"(bankroll ${args.bankroll:.0f} per season)...")
+          f"(bankroll ${args.bankroll:.0f}, paths={args.paths})...")
     t0 = time.time()
 
     for s in range(args.seasons):
         seed = args.seed + s * 10000
-        paths, wins = generate_paths(args.trades, seed=seed)
+        if args.paths == "real":
+            paths, wins = bootstrap_real_paths(real_paths, args.trades, seed=seed)
+        else:
+            paths, wins = generate_paths(args.trades, seed=seed)
         wr = wins / len(paths)
         print(f"  Season {s+1}/{args.seasons} (seed {seed}): "
               f"{wins}/{len(paths)} wins ({wr:.1%})", end="")
@@ -605,7 +692,7 @@ def main():
         label = cfg.get("label") or ""
         marker = "  <--" if label == "current" else ""
         roi_range = f"[{m['roi_min']:+.0%} to {m['roi_max']:+.0%}]"
-        print(f"  {rank:>3}  {label:>12}  {cfg['stop_loss']:>+8.0%}  "
+        print(f"  {rank:>3}  {label:>12}  {_fmt_stop(cfg['stop_loss']):>8}  "
               f"{_fmt_start(cfg['ladder']):>6}  {_fmt_gaps(cfg['ladder']):>10}  "
               f"{m['roi']:>+7.1%}  {roi_range:>16}  "
               f"{m['sharpe']:>+6.3f}  {m['max_dd_pct']:>5.1%}  "
@@ -623,7 +710,7 @@ def main():
         cfg, m = all_results[current_rank - 1]
         roi_range = f"[{m['roi_min']:+.0%} to {m['roi_max']:+.0%}]"
         print(f"  ...")
-        print(f"  {current_rank:>3}  {'current':>12}  {cfg['stop_loss']:>+8.0%}  "
+        print(f"  {current_rank:>3}  {'current':>12}  {_fmt_stop(cfg['stop_loss']):>8}  "
               f"{_fmt_start(cfg['ladder']):>6}  {_fmt_gaps(cfg['ladder']):>10}  "
               f"{m['roi']:>+7.1%}  {roi_range:>16}  "
               f"{m['sharpe']:>+6.3f}  {m['max_dd_pct']:>5.1%}  "
@@ -634,7 +721,7 @@ def main():
     print(f"\n{'=' * 115}")
     print(f"  BEST CONFIG{'  (rank #' + str(current_rank) + ' = current)' if current_rank == 1 else ''}")
     print(f"{'=' * 115}")
-    print(f"  Stop loss: {best_cfg['stop_loss']:.0%}")
+    print(f"  Stop loss: {_fmt_stop(best_cfg['stop_loss'])}")
     if best_cfg["ladder"]:
         print(f"  Floor activation: +{best_cfg['ladder'][0][0]:.0%} gain")
         print(f"  Ladder:")
@@ -676,7 +763,10 @@ def main():
             floor_cfg = cfg
             break
     if floor_cfg:
-        seed0_paths, _ = generate_paths(args.trades, seed=args.seed)
+        if args.paths == "real":
+            seed0_paths, _ = bootstrap_real_paths(real_paths, args.trades, seed=args.seed)
+        else:
+            seed0_paths, _ = generate_paths(args.trades, seed=args.seed)
         # Detailed per-trade tracking
         by_reason_pnl = {}
         for entry_price, model_prob, edge, prices, final_outcome in seed0_paths:

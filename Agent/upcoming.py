@@ -131,15 +131,15 @@ def _parse_matches_page(soup):
         eta = link.select_one(".match-item-eta")
         eta_text = eta.text.strip().lower() if eta else ""
         is_live = "live" in eta_text
-        if "ago" in eta_text:
-            continue  # Recently ended, skip
 
-        # Skip completed matches (have numeric scores) — but keep live matches
-        if not is_live:
-            score_spans = link.select(".match-item-vs-team-score")
-            has_score = any(s.text.strip().isdigit() for s in score_spans)
-            if has_score:
-                continue
+        # Skip truly-ended matches.  The eta showing "Xm ago" is not enough —
+        # VLR also uses "Xm ago" on live matches whose listed start time has
+        # passed.  Require numeric scores (a completed map count) before
+        # dropping, so we don't silently eat a live match.
+        score_spans = link.select(".match-item-vs-team-score")
+        has_score = any(s.text.strip().isdigit() for s in score_spans)
+        if has_score and not is_live:
+            continue
 
         # Team names
         team_divs = link.select(".match-item-vs-team-name")

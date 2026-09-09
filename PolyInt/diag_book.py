@@ -52,8 +52,8 @@ def _dump_book(label, book):
     """Pretty-print a raw order book: all bids and asks with their original order."""
     print(f"  {label}")
 
-    bids = list(book.bids or [])
-    asks = list(book.asks or [])
+    bids = list(book.get("bids") or [])
+    asks = list(book.get("asks") or [])
 
     if not bids and not asks:
         print("    (empty book)")
@@ -61,11 +61,11 @@ def _dump_book(label, book):
 
     print(f"    bids ({len(bids)}) [as returned by API]:")
     for i, b in enumerate(bids):
-        print(f"      [{i}] price={float(b.price):.4f}  size={float(b.size):.2f}")
+        print(f"      [{i}] price={float(b['price']):.4f}  size={float(b['size']):.2f}")
 
     print(f"    asks ({len(asks)}) [as returned by API]:")
     for i, a in enumerate(asks):
-        print(f"      [{i}] price={float(a.price):.4f}  size={float(a.size):.2f}")
+        print(f"      [{i}] price={float(a['price']):.4f}  size={float(a['size']):.2f}")
 
 
 def _analyze(token_label, token_id, trader, gamma_best_bid, gamma_best_ask):
@@ -75,13 +75,16 @@ def _analyze(token_label, token_id, trader, gamma_best_bid, gamma_best_ask):
     book = trader.client.get_order_book(token_id)
     _dump_book("raw book:", book)
 
+    bids = book.get("bids") or []
+    asks = book.get("asks") or []
+
     # OLD wrong read
-    old_bid = float(book.bids[0].price) if book.bids else None
-    old_ask = float(book.asks[0].price) if book.asks else None
+    old_bid = float(bids[0]["price"]) if bids else None
+    old_ask = float(asks[0]["price"]) if asks else None
 
     # NEW fixed read (what get_market_price now does)
-    new_bid = max((float(b.price) for b in book.bids), default=None)
-    new_ask = min((float(a.price) for a in book.asks), default=None)
+    new_bid = max((float(b["price"]) for b in bids), default=None)
+    new_ask = min((float(a["price"]) for a in asks), default=None)
 
     last_trade = trader.get_last_trade(token_id)
 
